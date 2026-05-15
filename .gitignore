@@ -1,0 +1,9 @@
+code/diagnostics/*
+code/logs/*
+dataset/*
+submission*
+code/models/*
+PIPELINE.md
+.claude/*
+code/patchtst/models_pt/*
+**/__pycache__/**
