@@ -40,7 +40,7 @@ import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
-from config import METEO_FEATURES, MODELS_DIR
+from config import METEO_FEATURES, MODELS_DIR, SCORE_LAG_TEST_GAP_SHIFT
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +105,7 @@ def add_woy_score_climatology(
 # ---------------------------------------------------------------------------
 
 # Subset of meteo to standardize against historical norms.
-ANOMALY_FEATURES = ["tmp_max", "tmp_min", "prec", "humidity", "wind_max", "surf_pre"]
+ANOMALY_FEATURES = ["tmp_max", "tmp_min", "prec", "humidity", "surf_pre", "tmp_range"]
 
 
 def compute_woy_meteo_climatology(weekly_df_train: pd.DataFrame) -> pd.DataFrame:
@@ -156,7 +156,7 @@ def add_anomaly_features(
 # Block 3: trend / momentum features (slope of last N lags)
 # ---------------------------------------------------------------------------
 
-TREND_FEATURES = ["prec_mean", "tmp_max_mean", "tmp_range_mean", "wind_max_mean", "humidity_mean"]
+TREND_FEATURES = ["prec_mean", "tmp_max_mean", "tmp_range_mean", "humidity_mean"]
 
 
 def _slope_over_lags(df: pd.DataFrame, base: str, lags: list[int]) -> pd.Series:
@@ -190,13 +190,12 @@ def add_trend_features(features_df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def add_interaction_features(features_df: pd.DataFrame) -> pd.DataFrame:
-    """Hand-picked interactions for fire-weather / extreme-condition signatures."""
+    """Hand-picked interactions for fire-weather / extreme-condition signatures.
+    The three wind_max_lag0-based interactions (int_prec_wind, int_tmprange_wind,
+    int_low_pressure) were dropped along with the wind feature family."""
     df = features_df.copy()
-    df["int_prec_wind"] = (df["prec_mean_lag0"] * df["wind_max_lag0"]).astype(np.float32)
     df["int_hot_dry"] = (df["tmp_max_mean_lag0"] * (1.0 - df["humidity_mean_lag0"])).astype(np.float32)
-    df["int_tmprange_wind"] = (df["tmp_range_mean_lag0"] * df["wind_max_lag0"]).astype(np.float32)
     df["int_prec_humid"] = (df["prec_mean_lag0"] * df["humidity_mean_lag0"]).astype(np.float32)
-    df["int_low_pressure"] = (-df["surf_pre_min_lag0"] * df["wind_max_lag0"]).astype(np.float32)
     return df
 
 
@@ -220,7 +219,7 @@ def add_interaction_features(features_df: pd.DataFrame) -> pd.DataFrame:
 # is the score at the very last scored anchor in train. We persist the last
 # 8 anchor scores per region to `region_last_scores.csv` after training.
 
-SCORE_LAG_OFFSETS = [1, 2, 4, 8]
+SCORE_LAG_OFFSETS = [1, 2, 4, 8, 52]
 SCORE_LAG_COLS = (
     [f"score_lag{k}" for k in SCORE_LAG_OFFSETS]
     + ["weeks_since_last_nonzero", "max_score_prev8"]
@@ -239,11 +238,16 @@ def _per_region_score_arrays(weekly_df: pd.DataFrame) -> dict[str, np.ndarray]:
 def add_score_lag_features_train(
     features_df: pd.DataFrame,
     weekly_df: pd.DataFrame,
+    shift: int = SCORE_LAG_TEST_GAP_SHIFT,
 ) -> pd.DataFrame:
     """
     Add SCORE_LAG_COLS to a training feature matrix by looking up the score at
-    (region_id, week_idx − lag) in `weekly_df`. weekly_df must be the same
-    object that produced features_df (1 row per region per scored week).
+    (region_id, week_idx − lag − shift) in `weekly_df`. `shift` matches test's
+    information staleness: test predicts 5 weeks after a 13-week unscored
+    block, so the lag source is (shift+1)=14 weeks before the first target.
+    Training with shift=12 makes its (lag-source → first-target) distance 14.
+    weekly_df must be the same object that produced features_df (1 row per
+    region per scored week).
     """
     df = features_df.copy()
     score_by_region = _per_region_score_arrays(weekly_df)
@@ -257,14 +261,14 @@ def add_score_lag_features_train(
         wi = int(week_idxs[i])
         scores = score_by_region[rid]
         for k in SCORE_LAG_OFFSETS:
-            idx = wi - k
+            idx = wi - k - shift
             out_cols[f"score_lag{k}"][i] = scores[idx] if 0 <= idx < len(scores) else 0.0
 
-        # weeks_since_last_nonzero: scan back from wi-1 until we hit a nonzero
-        # score. Cap at 26 weeks; if none found, 26.
+        # weeks_since_last_nonzero: scan back from wi - 1 - shift until we
+        # hit a nonzero score. Cap at 26 weeks; if none found, 26.
         last_nonzero = 26
         for back in range(1, 27):
-            idx = wi - back
+            idx = wi - back - shift
             if idx < 0:
                 break
             if scores[idx] > 0:
@@ -272,10 +276,13 @@ def add_score_lag_features_train(
                 break
         out_cols["weeks_since_last_nonzero"][i] = float(last_nonzero)
 
-        # max_score_prev8: window of [wi-8, wi-1].
-        lo = max(0, wi - 8)
-        if lo < wi:
-            out_cols["max_score_prev8"][i] = float(scores[lo:wi].max())
+        # max_score_prev8: window of [wi - 8 - shift, wi - 1 - shift]. With
+        # shift=12 this is weeks 21..14 back from the anchor, matching test's
+        # "last 8 training weeks" window.
+        lo = max(0, wi - 8 - shift)
+        hi = max(0, wi - shift)
+        if lo < hi:
+            out_cols["max_score_prev8"][i] = float(scores[lo:hi].max())
         else:
             out_cols["max_score_prev8"][i] = 0.0
 
@@ -418,11 +425,8 @@ EXTRA_FEATURE_COLS_V2 = (
     + [f"slope8_{b}" for b in TREND_FEATURES]
     # — Block 4: interactions
     + [
-        "int_prec_wind",
         "int_hot_dry",
-        "int_tmprange_wind",
         "int_prec_humid",
-        "int_low_pressure",
     ]
 )
 

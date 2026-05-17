@@ -41,12 +41,12 @@ REGION_EMB_DIM = 16
 # --- Training ------------------------------------------------------------
 BATCH_SIZE = 256
 NUM_WORKERS_LOADER = 4
-LR = 1e-3
-WEIGHT_DECAY = 1e-4
-EPOCHS = 50
+LR = 5e-4
+WEIGHT_DECAY = 5e-5
+EPOCHS = 100
 WARMUP_EPOCHS = 2
 GRAD_CLIP = 1.0
-EARLY_STOP_PATIENCE = 6
+EARLY_STOP_PATIENCE = 10
 SEED = 42
 
 # Subsample majority-class anchors (all 5 future scores == 0) to this fraction
@@ -55,8 +55,8 @@ MAJORITY_KEEP_FRAC = 1.0
 
 # Sample weighting on top of the L1 loss. weight = 1 + ALPHA*1[max_y>0] + BETA*1[max_y>=3]
 # Mirrors the LGBM weighting scheme so subsampling and weighting compound.
-SAMPLE_WEIGHT_ALPHA = 0.5    # lower than LGBM's 1.0 because subsampling already shifts the mix
-SAMPLE_WEIGHT_BETA = 1.5
+SAMPLE_WEIGHT_ALPHA = 0    # lower than LGBM's 1.0 because subsampling already shifts the mix
+SAMPLE_WEIGHT_BETA = 0
 
 # --- Validation ----------------------------------------------------------
 # Match the LGBM track: last 26 weeks per region are the validation holdout.

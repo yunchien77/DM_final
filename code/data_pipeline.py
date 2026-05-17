@@ -94,12 +94,16 @@ def _worker_weekly_train(args: tuple):
         meta[week_idx, 2] = doy
         meta[week_idx, 3] = int(scores[anchor_i])
 
-        # Layout: stats[w, fi*5 + 0..4] = (mean, std, min, max, sum) of feature fi.
+        # Layout: stats[w, fi*N_STATS + 0..N_STATS-1] = (mean, std, min, max, sum, p95).
         stats[week_idx, 0::N_STATS] = np.nanmean(block, axis=0)
         stats[week_idx, 1::N_STATS] = np.nanstd(block, axis=0)
         stats[week_idx, 2::N_STATS] = np.nanmin(block, axis=0)
         stats[week_idx, 3::N_STATS] = np.nanmax(block, axis=0)
         stats[week_idx, 4::N_STATS] = np.nansum(block, axis=0)
+        # Phase 2: p95 captures tail intensity that min/max/std flatten —
+        # a single extreme day in a week of 6 normal ones is invisible to
+        # mean/std but jumps p95.
+        stats[week_idx, 5::N_STATS] = np.nanpercentile(block, 95, axis=0)
 
     return region_id, meta, stats
 
@@ -131,6 +135,7 @@ def _worker_weekly_test(args: tuple):
         stats[w, 2::N_STATS] = np.nanmin(block, axis=0)
         stats[w, 3::N_STATS] = np.nanmax(block, axis=0)
         stats[w, 4::N_STATS] = np.nansum(block, axis=0)
+        stats[w, 5::N_STATS] = np.nanpercentile(block, 95, axis=0)
 
     return region_id, meta, stats
 

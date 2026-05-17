@@ -2,10 +2,17 @@
 
 Reads weekly stats from train.csv + test.csv (the last LOOKBACK_WEEKS - 13
 training weeks + 13 test weeks form the input window per region), loads the
-trained PatchTSTRegressor, and writes submission_patchtst.csv.
+trained PatchTSTRegressor, and writes the submission CSV (default path from
+config_pt.PT_SUBMISSION_PATH, overridable via --output).
+
+Examples:
+    python -m patchtst.predict_pt
+    python -m patchtst.predict_pt --output submission_v2.csv
+    python -m patchtst.predict_pt -o /abs/path/submission.csv
 """
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -40,9 +47,14 @@ def _last_anchor_per_region(stat_mats):
     return np.asarray(anchors, dtype=np.int32)
 
 
-def main():
+def main(output_path: Path | str | None = None):
+    if output_path is None:
+        output_path = PT_SUBMISSION_PATH
+    output_path = Path(output_path)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    print(f"Output: {output_path}")
 
     preproc_artifacts = None
     if USE_PREPROCESSING:
@@ -163,10 +175,23 @@ def main():
     sub = sample_subset.merge(sub, on="region_id", how="left")
     assert not sub.isna().any().any(), "missing region predictions among the ones we predicted"
 
-    sub.to_csv(PT_SUBMISSION_PATH, index=False)
-    print(f"Wrote {PT_SUBMISSION_PATH}  shape={sub.shape}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sub.to_csv(output_path, index=False)
+    print(f"Wrote {output_path}  shape={sub.shape}")
     print(sub.head().to_string(index=False))
 
 
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="PatchTST inference -> submission CSV.",
+    )
+    p.add_argument(
+        "-o", "--output", type=str, default=None,
+        help=f"Output submission CSV path. Default: {PT_SUBMISSION_PATH}",
+    )
+    return p.parse_args()
+
+
 if __name__ == "__main__":
-    main()
+    args = _parse_args()
+    main(output_path=args.output)

@@ -5,10 +5,14 @@ Mirrors train.py's feature-engineering steps exactly, then predicts 5 horizons
 per region with the saved L1 LightGBM boosters.
 
 Usage:
-    python predict.py
+    python predict.py                              # default SUBMISSION_PATH
+    python predict.py --output submission_v2.csv   # custom CWD-relative path
+    python predict.py -o /abs/path/submission.csv  # absolute path
 """
 
+import argparse
 import time
+from pathlib import Path
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -28,6 +32,7 @@ from data_pipeline import (
 )
 from features import add_temporal_features, add_region_features, clip_predictions
 from model import load_all_models
+from cache import cache_path, feature_cache_key, load_from_cache, save_to_cache
 
 if USE_EXTRA_FEATURES:
     from features_extra import (
@@ -46,21 +51,10 @@ def _predict(model, X):
     return np.clip(model.predict(X), 0.0, 5.0)
 
 
-def main():
-    t0 = time.time()
-    log.info("=" * 70)
-    log.info("DMFP inference run | model=L1 LightGBM")
-    log.info(f"  log file: {current_log_path()}")
-    log.info("=" * 70)
-
-    # ------------------------------------------------------------------
-    # Load artifacts from training
-    # ------------------------------------------------------------------
-    log.info("[1/4] Loading models and feature column list...")
-    models = load_all_models()
-    feature_cols = load_feature_columns()
-    region_stats = pd.read_csv(MODELS_DIR / "region_stats.csv")
-
+def _build_test_features(region_stats: pd.DataFrame) -> pd.DataFrame:
+    """Stages [2/4]–[3/4]: aggregate test daily → weekly → lag/temporal/region/
+    extra/score-lag/cluster features. Returns the test_features DataFrame ready
+    for column alignment against feature_cols.json."""
     preproc_artifacts = None
     if USE_PREPROCESSING:
         from preprocessing import load_preprocessing_artifacts
@@ -69,9 +63,6 @@ def main():
                  f"(winsor={len(preproc_artifacts[0])}, log/sqrt={len(preproc_artifacts[1])}, "
                  f"rank={len(preproc_artifacts[3])})")
 
-    # ------------------------------------------------------------------
-    # Process test data
-    # ------------------------------------------------------------------
     log.info("[2/4] Loading and aggregating test daily → weekly...")
     test_weekly = load_and_aggregate_daily_to_weekly(
         TEST_PATH, is_train=False, preproc_artifacts=preproc_artifacts,
@@ -97,6 +88,45 @@ def main():
     if USE_REGION_CLUSTER_FEATURES:
         cluster_table = pd.read_csv(REGION_CLUSTERS_CSV)
         test_features = add_region_cluster_features(test_features, cluster_table)
+
+    return test_features
+
+
+def main(output_path: Path | str | None = None):
+    if output_path is None:
+        output_path = SUBMISSION_PATH
+    output_path = Path(output_path)
+
+    t0 = time.time()
+    log.info("=" * 70)
+    log.info("DMFP inference run | model=L1 LightGBM")
+    log.info(f"  log file: {current_log_path()}")
+    log.info(f"  output  : {output_path}")
+    log.info("=" * 70)
+
+    # ------------------------------------------------------------------
+    # Load artifacts from training
+    # ------------------------------------------------------------------
+    log.info("[1/4] Loading models and feature column list...")
+    models = load_all_models()
+    feature_cols = load_feature_columns()
+    region_stats = pd.read_csv(MODELS_DIR / "region_stats.csv")
+
+    # ------------------------------------------------------------------
+    # Cache check (shares the train-time feature_cache_key). On hit we skip
+    # the test-side aggregation + feature build entirely.
+    # ------------------------------------------------------------------
+    key = feature_cache_key()
+    log.info(f"[cache] key={key}  path={cache_path('test_features', key)}")
+    cached = load_from_cache("test_features", key)
+    if cached is not None:
+        log.info(f"[cache] hit: skipping [2/4]–[3/4]")
+        test_features = cached
+    else:
+        log.info(f"[cache] miss: rebuilding test features")
+        test_features = _build_test_features(region_stats)
+        save_to_cache(test_features, "test_features", key)
+        log.info(f"[cache] saved → {cache_path('test_features', key)}")
 
     # ------------------------------------------------------------------
     # Sanity checks: row count and feature alignment
@@ -128,13 +158,26 @@ def main():
     assert (submission[pred_cols] >= 0).all().all()
     assert (submission[pred_cols] <= 5).all().all()
 
-    submission.to_csv(SUBMISSION_PATH, index=False)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    submission.to_csv(output_path, index=False)
     elapsed = time.time() - t0
 
-    log.info(f"Submission saved to {SUBMISSION_PATH}")
+    log.info(f"Submission saved to {output_path}")
     log.info(f"Shape: {submission.shape}   Elapsed: {elapsed:.1f}s")
     log.info("Prediction summary:\n" + str(submission[pred_cols].describe().round(3)))
 
 
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="LGBM L1 inference → submission CSV.",
+    )
+    p.add_argument(
+        "-o", "--output", type=str, default=None,
+        help=f"Output submission CSV path. Default: {SUBMISSION_PATH}",
+    )
+    return p.parse_args()
+
+
 if __name__ == "__main__":
-    main()
+    args = _parse_args()
+    main(output_path=args.output)
