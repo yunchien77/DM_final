@@ -1,0 +1,8 @@
+logs/*
+dataset/*
+submission*
+.claude/*
+models/*/*.pkl
+models/*.pkl
+*.pkl
+**/__pycache__/**
