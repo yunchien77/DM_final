@@ -15,6 +15,9 @@ from config import (
     PREPROC_LOG_FEATURES,
     N_WORKERS, USE_ADVERSARIAL_WEIGHTS,
     USE_GAP_STRATIFIED, N_PH_FOLDS_SECONDARY,
+    USE_CALENDAR_SEASON_WEIGHTS, CALENDAR_SEASON_SLACK,
+    IN_SEASON_WEIGHT_BOOST, CALENDAR_SEVERE_THRESHOLD,
+    SEED,
     ensure_dirs,
 )
 from climatology import compute_climatology, save_climatology, load_climatology
@@ -109,6 +112,46 @@ def validate_regions_and_gap(
         log.info(f"  region_test_months sample: {dict(list(region_test_months.items())[:5])}")
 
     return (np.array(gaps) if gaps else np.array([])), region_gap_dict, region_test_months
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Calendar season weights
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _compute_season_weights(
+    y:                  np.ndarray,
+    groups:             np.ndarray,
+    month_keys:         np.ndarray,
+    region_test_months: dict[str, int],
+) -> np.ndarray:
+    """Return a per-sample season weight multiplier (float32, mean ≈ 1.0).
+
+    In-season samples (circular month distance ≤ CALENDAR_SEASON_SLACK) receive
+    IN_SEASON_WEIGHT_BOOST.  Off-season samples receive 1.0.  Severe drought
+    samples (score ≥ CALENDAR_SEVERE_THRESHOLD) always receive the boost so
+    that rare high-severity events are never down-weighted regardless of season.
+    The array is normalized to mean = 1.0 so it combines cleanly with other
+    sample weight components.
+    """
+    test_months = np.array(
+        [region_test_months.get(str(g), 0) for g in groups], dtype=np.int32
+    )
+    dist = np.abs(month_keys.astype(np.int32) - test_months)
+    dist = np.minimum(dist, 12 - dist)
+
+    is_in_season = (dist <= CALENDAR_SEASON_SLACK) & (test_months > 0)
+    is_severe    = y >= CALENDAR_SEVERE_THRESHOLD
+
+    weights = np.where(is_in_season | is_severe,
+                       float(IN_SEASON_WEIGHT_BOOST), 1.0).astype(np.float32)
+    weights /= weights.mean()
+
+    n_in   = int(is_in_season.sum())
+    n_sev  = int((is_severe & ~is_in_season).sum())
+    n_off  = int((~is_in_season & ~is_severe).sum())
+    log.info(f"  Season weights: in-season={n_in:,}  severe(off-season)={n_sev:,}  "
+             f"off-season={n_off:,}  boost={IN_SEASON_WEIGHT_BOOST}×")
+    return weights
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -370,11 +413,24 @@ def main(from_stage: int = 0, force: bool = False):
             _test_raw   = pd.read_csv(TEST_PATH,  usecols=["region_id"] + _test_meteo)
             av_dict     = compute_region_adversarial_weights(_train_raw, _test_raw)
             del _train_raw, _test_raw; gc.collect()
-            base_sw             = make_sample_weights(y)
+            # Pass pure ones so adversarial_weights contains only the av-ratio.
+            # model.py then multiplies by severity once: severity × av_ratio.
+            # (Previously make_sample_weights was passed here, causing severity².)
+            base_sw             = np.ones(len(y), dtype=np.float32)
             adversarial_weights = apply_adversarial_weights(base_sw, groups, av_dict)
             log.info(f"[Stage 3.5] done in {time.time()-t_av:.1f}s")
         except Exception as e:
             log.warning(f"[Stage 3.5] Failed ({e}), skipping")
+
+    # ── Stage 3.6: Calendar Season Weights ───────────────────────────────────
+    if USE_CALENDAR_SEASON_WEIGHTS and region_test_months:
+        log.info("[Stage 3.6] Computing calendar season weights ...")
+        season_w = _compute_season_weights(y, groups, month_keys, region_test_months)
+        if adversarial_weights is not None:
+            adversarial_weights = adversarial_weights * season_w
+            adversarial_weights = (adversarial_weights / adversarial_weights.mean()).astype(np.float32)
+        else:
+            adversarial_weights = season_w
 
     # ── Stage 4 ───────────────────────────────────────────────────────────────
     models, eval_report, oof_preds, region_strata = stage4_train(

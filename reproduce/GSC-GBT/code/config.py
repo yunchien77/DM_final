@@ -107,8 +107,8 @@ N_PRED               = 5     # forecast horizons (fw = 1..5 weeks)
 N_FOLDS              = 5
 N_PH_FOLDS           = 4     # walk-forward folds for the main model
 N_PH_FOLDS_SECONDARY = 2     # fewer folds for secondary models (speed vs. variance)
-MAX_WIN_PER_REGION   = 200
-SAMPLE_FRAC          = 0.6
+MAX_WIN_PER_REGION   = 200   # use more training windows per region
+SAMPLE_FRAC          = 1.0   # use all available data
 PURGE_GAP_DAYS       = 91    # temporal purge gap to prevent leakage
 
 USE_SAMPLE_WEIGHT = True
@@ -163,6 +163,25 @@ CALENDAR_MATCHED_MIN_SAMPLES = 20   # minimum val samples; falls back to all-val
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Calendar Season Weighting (training)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Upweight training samples whose month is close to the region's test season.
+# No data is discarded — off-season samples stay but receive weight 1.0.
+# In-season samples (dist ≤ SLACK months) receive IN_SEASON_BOOST.
+# Severe drought samples (score ≥ SEVERE_THRESHOLD) always receive the boost
+# regardless of season, so rare events are never down-weighted.
+# Disabled for baseline recovery: previously caused 1.0265 due to interaction
+# with double-severity bug (severity² amplification).  The bug is now fixed in
+# train.py (adversarial_weights passes pure av-ratio, not pre-multiplied by
+# severity).  Re-enable after confirming baseline is restored.
+USE_CALENDAR_SEASON_WEIGHTS      = False
+CALENDAR_SEASON_SLACK            = 2     # ± months (same as CALENDAR_BANDWIDTH)
+IN_SEASON_WEIGHT_BOOST           = 2.0  # multiplier for in-season samples
+CALENDAR_SEVERE_THRESHOLD        = 3.0  # score ≥ this always gets the boost
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Score Lag Gap Shift
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -177,10 +196,25 @@ USE_GAP_ADAPTIVE_FALLBACK = True
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Kaggle Proxy Validation
+# ═════════════════════════════════════════════════════════════════════════════
+
+# For each region per fw, hold out the most recent in-season anchor as a fixed
+# early-stopping set that mirrors the Kaggle evaluation split exactly.
+# This prevents overfitting to the walk-forward CV validation distribution
+# which may not match the test season.
+USE_KAGGLE_PROXY_VAL = True
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Adversarial Weighting
 # ═════════════════════════════════════════════════════════════════════════════
 
-USE_ADVERSARIAL_WEIGHTS = True
+# Disabled: all 2248 train regions == all 2248 test regions, so the binary
+# classifier predicts P(test-like)≈0 for all train rows → weights all clip to
+# AV_CLIP_LO and normalize to 1.0 (no effect).  Re-enable when train/test
+# region sets diverge.
+USE_ADVERSARIAL_WEIGHTS = False
 AV_CLIP_LO              = 0.25   # clip adversarial weight ratio below this
 AV_CLIP_HI              = 4.0    # clip adversarial weight ratio above this
 

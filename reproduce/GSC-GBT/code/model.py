@@ -38,6 +38,7 @@ from config import (
     USE_CALENDAR_MATCHED_VAL, CALENDAR_BANDWIDTH, CALENDAR_MATCHED_MIN_SAMPLES,
     USE_GPU_LGBM, LGBM_DEVICE, N_GPUS,
     PARALLEL_FW_TRAINING,
+    USE_KAGGLE_PROXY_VAL,
 )
 from temporal_cv import TemporalKFold
 from data_pipeline import make_sample_weights
@@ -85,6 +86,54 @@ def _calendar_matched_val(
     if mask.sum() >= min_samples:
         return va_pos[mask]
     return va_pos
+
+
+def _extract_kaggle_val_mask(
+    grp_fw:             np.ndarray,
+    tk_fw:              np.ndarray,
+    mo_fw:              np.ndarray,
+    region_test_months: dict[str, int],
+    bandwidth:          int = CALENDAR_BANDWIDTH,
+) -> np.ndarray:
+    """Build a holdout mask that mirrors the Kaggle evaluation split.
+
+    For each region in the fw-slice, select the **most recent in-season
+    anchor** (circular month distance ≤ bandwidth) as a fixed early-stopping
+    proxy.  The mask has exactly one True per region that has an in-season
+    sample; regions without any in-season data are skipped.
+
+    The holdout samples are excluded from the walk-forward CV entirely and
+    used as a fixed eval set for early stopping in every fold.  This prevents
+    the model from overfitting to the CV val distribution (which covers the
+    full training timeline) and instead stops when test-season performance
+    peaks — replicating how Kaggle scores the submission.
+    """
+    kv_mask = np.zeros(len(grp_fw), dtype=bool)
+    if mo_fw is None or region_test_months is None:
+        return kv_mask
+
+    for region in np.unique(grp_fw):
+        r_mask   = grp_fw == region
+        test_m   = region_test_months.get(str(region), 0)
+        if test_m == 0:
+            continue
+        r_months = mo_fw[r_mask].astype(int)
+        r_times  = tk_fw[r_mask]
+        r_idx    = np.where(r_mask)[0]
+
+        dist      = np.abs(r_months - test_m)
+        dist      = np.minimum(dist, 12 - dist)
+        in_season = dist <= bandwidth
+
+        if not in_season.any():
+            continue
+
+        # Pick the most recent in-season sample as holdout
+        in_idx = r_idx[in_season]
+        best   = in_idx[np.argmax(r_times[in_season])]
+        kv_mask[best] = True
+
+    return kv_mask
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -159,12 +208,16 @@ def _train_one_fw(args: tuple) -> tuple:
 
     Returns (fw, fw_models, oof_slice_dict, fold_maes).
     oof_slice_dict maps original row indices to OOF predictions.
+
+    args[18] = kv_mask_fw (bool array | None) — Kaggle proxy val holdout mask.
+    When provided, those samples are excluded from walk-forward CV and used as
+    a fixed early-stopping set that approximates the Kaggle evaluation split.
     """
     (fw, X_fw, y_fw, sw_fw, tk_fw, grp_fw, mo_fw,
      region_test_months, use_cal, gpu_id,
      n_ph_folds, purge_gap_days, early_stopping_rounds,
      lgbm_params, use_gpu_lgbm, lgbm_device, n_gpus,
-     orig_idx_fw) = args
+     orig_idx_fw, kv_mask_fw) = args
 
     import numpy as np
     import lightgbm as lgb
@@ -175,36 +228,60 @@ def _train_one_fw(args: tuple) -> tuple:
         d = abs(int(m1) - int(m2))
         return min(d, 12 - d)
 
+    # ── Extract Kaggle proxy val holdout ──────────────────────────────────────
+    X_kv, y_kv = None, None
+    if kv_mask_fw is not None and kv_mask_fw.sum() >= 5:
+        X_kv = X_fw[kv_mask_fw]
+        y_kv = y_fw[kv_mask_fw]
+        keep_mask = ~kv_mask_fw
+    else:
+        keep_mask = np.ones(len(X_fw), dtype=bool)
+
+    # CV uses only the non-holdout slice
+    X_cv      = X_fw[keep_mask]
+    y_cv      = y_fw[keep_mask]
+    tk_cv     = tk_fw[keep_mask]
+    sw_cv     = sw_fw[keep_mask] if sw_fw is not None else None
+    grp_cv    = grp_fw[keep_mask]
+    mo_cv     = mo_fw[keep_mask] if mo_fw is not None else None
+    orig_cv   = orig_idx_fw[keep_mask]
+
     tkf = TemporalKFold(n_splits=n_ph_folds, gap_days=purge_gap_days)
     fw_models, fold_maes = [], []
     oof_slice = {}
 
-    for fold_idx, (tr_pos, va_pos) in enumerate(tkf.split(tk_fw)):
+    for fold_idx, (tr_pos, va_pos) in enumerate(tkf.split(tk_cv)):
         if len(tr_pos) < 20 or len(va_pos) < 10:
             continue
 
-        X_tr, y_tr = X_fw[tr_pos], y_fw[tr_pos]
-        X_va, y_va = X_fw[va_pos], y_fw[va_pos]
-        sw_tr = sw_fw[tr_pos] if sw_fw is not None else None
+        X_tr, y_tr = X_cv[tr_pos], y_cv[tr_pos]
+        X_va, y_va = X_cv[va_pos], y_cv[va_pos]
+        sw_tr = sw_cv[tr_pos] if sw_cv is not None else None
 
-        # Calendar-Matched early stopping set
-        X_es, y_es = None, None
-        if use_cal and mo_fw is not None and region_test_months is not None:
+        # ── Early-stopping set priority ───────────────────────────────────────
+        # 1. Kaggle proxy val (best — mirrors Kaggle evaluation split)
+        # 2. Calendar-matched val subset (fallback when no proxy val)
+        # 3. Full validation fold (last resort)
+        if X_kv is not None:
+            es_set = (X_kv, y_kv)
+        elif use_cal and mo_cv is not None and region_test_months is not None:
             mask = np.array([
-                _month_dist_local(mo_fw[va_pos[i]],
-                                  region_test_months.get(str(grp_fw[va_pos[i]]), mo_fw[va_pos[i]])) <= 2
+                _month_dist_local(mo_cv[va_pos[i]],
+                                  region_test_months.get(str(grp_cv[va_pos[i]]),
+                                                         mo_cv[va_pos[i]])) <= 2
                 for i in range(len(va_pos))
             ], dtype=bool)
             if mask.sum() >= 20:
-                X_es = X_fw[va_pos[mask]]
-                y_es = y_fw[va_pos[mask]]
+                es_set = (X_cv[va_pos[mask]], y_cv[va_pos[mask]])
+            else:
+                es_set = (X_va, y_va)
+        else:
+            es_set = (X_va, y_va)
 
         params = dict(lgbm_params)
         if use_gpu_lgbm:
             params["device_type"]   = lgbm_device
             params["gpu_device_id"] = gpu_id % max(1, n_gpus)
-
-        es_set = (X_es, y_es) if X_es is not None else (X_va, y_va)
 
         def _do_fit(p):
             m = lgb.LGBMRegressor(**p)
@@ -233,31 +310,32 @@ def _train_one_fw(args: tuple) -> tuple:
         fw_models.append(model)
         val_pred = model.predict(X_va).astype(np.float32)
         for i, pos in enumerate(va_pos):
-            oof_slice[int(orig_idx_fw[pos])] = float(val_pred[i])
+            oof_slice[int(orig_cv[pos])] = float(val_pred[i])
         fold_maes.append(float(mean_absolute_error(y_va, np.clip(val_pred, 0, 5))))
 
     if not fw_models:
-        # Fallback: single 80/20 split when no fold produced enough data
-        split = int(len(X_fw) * 0.8)
-        if split >= 20 and len(X_fw) - split >= 10:
+        # Fallback: single 80/20 split on the CV slice when no fold had enough data
+        split = int(len(X_cv) * 0.8)
+        if split >= 20 and len(X_cv) - split >= 10:
             params = dict(lgbm_params)
             if use_gpu_lgbm:
                 params["device_type"]   = lgbm_device
                 params["gpu_device_id"] = gpu_id % max(1, n_gpus)
+            es_fb = (X_kv, y_kv) if X_kv is not None else (X_cv[split:], y_cv[split:])
             try:
                 m = lgb.LGBMRegressor(**params)
-                m.fit(X_fw[:split], y_fw[:split],
-                      sample_weight=sw_fw[:split] if sw_fw is not None else None,
-                      eval_set=[(X_fw[split:], y_fw[split:])],
+                m.fit(X_cv[:split], y_cv[:split],
+                      sample_weight=sw_cv[:split] if sw_cv is not None else None,
+                      eval_set=[es_fb],
                       callbacks=[lgb.early_stopping(early_stopping_rounds, verbose=False),
                                  lgb.log_evaluation(period=-1)])
                 fw_models = [m]
             except Exception:
                 pass
-            preds = fw_models[0].predict(X_fw[split:]).astype(np.float32) if fw_models else np.array([])
-            for i, pos in enumerate(range(split, len(X_fw))):
+            preds = fw_models[0].predict(X_cv[split:]).astype(np.float32) if fw_models else np.array([])
+            for i, pos in enumerate(range(split, len(X_cv))):
                 if i < len(preds):
-                    oof_slice[int(orig_idx_fw[pos])] = float(preds[i])
+                    oof_slice[int(orig_cv[pos])] = float(preds[i])
 
     return fw, fw_models, oof_slice, fold_maes
 
@@ -315,12 +393,22 @@ def train_lgbm_per_horizon(
         if len(X_fw) < 50:
             log.warning(f"  fw={fw}: too few samples ({len(X_fw)}), skipping")
             continue
+
+        # ── Kaggle proxy val holdout mask ─────────────────────────────────────
+        kv_mask_fw = None
+        if USE_KAGGLE_PROXY_VAL and mo_fw is not None and region_test_months is not None:
+            kv_mask_fw = _extract_kaggle_val_mask(
+                grp_fw, tk_fw, mo_fw, region_test_months, bandwidth=CALENDAR_BANDWIDTH
+            )
+            log.info(f"  fw={fw}: Kaggle proxy val holdout={kv_mask_fw.sum()} samples "
+                     f"({len(np.unique(grp_fw))} regions)")
+
         fw_args_list.append((
             fw, X_fw, y_fw, sw_fw, tk_fw, grp_fw, mo_fw,
             region_test_months, use_cal, (fw - 1) % max(1, N_GPUS),
             _n_folds, PURGE_GAP_DAYS, EARLY_STOPPING_ROUNDS,
             dict(LGBM_PARAMS), USE_GPU_LGBM, LGBM_DEVICE, N_GPUS,
-            orig_idx,
+            orig_idx, kv_mask_fw,
         ))
 
     if PARALLEL_FW_TRAINING and len(fw_args_list) > 1:
