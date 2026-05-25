@@ -1,575 +1,534 @@
-"""
-End-to-end training entry point.
+"""Phase 7 training entry point.
 
-Pipeline (all stages logged to code/logs/train_<timestamp>.log + stdout):
-  Stage 0 — fit daily-level preprocessing artifacts (USE_PREPROCESSING)
-  Stage 1 — daily → weekly aggregation
-  Stage 2 — lag feature matrix
-  Stage 3 — temporal + region + woy + score-lag + cluster features
-  Stage 4 — 5× per-horizon LightGBM L1 with severe-row sample weighting
-  Stage 5 — validation eval + persist (lgbm_h{1..5}.txt, val_preds.npz, etc.)
+Pipeline:
+  Stage 0 — fit daily preprocessing artifacts (USE_PREPROCESSING)
+  Stage 1 — daily → weekly aggregation (incl. pressure-derived stats)
+  Stage 2 — anchor rows
+  Stage 3 — features: score_lag1, region history, calendar, score climatology,
+            climate features, sliding-window stats
+  Stage 4 — (optional) shift-aware collinearity pruning
+  Stage 5 — train 5 LightGBM L1 boosters
+  Stage 6 — build drought transition matrices
 
-Usage:
+Run:
     python train.py
 """
 
+from __future__ import annotations
+
+import json
 import time
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
-from logging_setup import get_logger, current_log_path
+from logging_setup import get_logger
 log = get_logger("train", label="train")
 
 from config import (
-    TRAIN_PATH, TEST_PATH, LAG_WINDOW, MODELS_DIR, HORIZONS,
-    USE_EXTRA_FEATURES,
-    USE_PREPROCESSING, USE_SCORE_LAG_FEATURES, USE_REGION_CLUSTER_FEATURES,
-    USE_RANK_NORMALIZATION, RANK_NORMALIZE_FEATURES, N_REGION_CLUSTERS,
-    SAMPLE_WEIGHT_ALPHA, SAMPLE_WEIGHT_BETA,
-    RUN_WALK_FORWARD_DIAGNOSTIC, WALK_FORWARD_FOLD_BOUNDARIES,
-    METEO_FEATURES,
+    TRAIN_PATH, TEST_PATH, MODELS_DIR, HORIZONS, LAG_WINDOW,
+    USE_PREPROCESSING, USE_RANK_NORMALIZATION, RANK_NORMALIZE_FEATURES,
+    USE_SCORE_LAG, USE_CLIMATE_FEATURES, USE_WINDOWED_FEATURES,
+    USE_PROXY_SCORE, USE_METEO_CLUSTER,
+    USE_TRANSITION_SMOOTHING, TRANSITION_CLUSTERS, TRANSITION_SMOOTHING_ALPHA,
+    USE_TRANSITION_WEIGHT, TRANSITION_WEIGHT_GAMMA,
+    USE_SEVERITY_WEIGHT, SAMPLE_WEIGHT_ALPHA, SAMPLE_WEIGHT_BETA,
+    USE_ZERO_INFLATED,
+    USE_WALK_FORWARD_CV, N_WF_FOLDS, WF_PURGE_WEEKS, USE_ISOTONIC_CALIBRATION,
+    USE_PRUNING, PRUNING_CORRELATION_THRESHOLD, PRUNING_VIF_THRESHOLD,
+    LEAN_FEATURE_LIST_PATH, WINDOWED_CHANNELS, WINDOWED_WINDOWS,
     CALENDAR_MATCHED_VALIDATION, CALENDAR_MATCHED_SLACK_WEEKS,
     CALENDAR_MATCHED_LAST_YEAR_ONLY,
-    USE_FEATURE_AUDIT_PRUNE, PRUNED_FEATURE_LIST_PATH,
-    USE_CALENDAR_MATCHED_TRAINING, OFF_SEASON_TAIL_FRAC,
-    CALENDAR_MATCHED_TRAINING_SEED,
-    USE_ADVERSARIAL_WEIGHTING, AV_CLIP_LO, AV_CLIP_HI,
-    AV_CLASSIFIER_MAX_TRAIN_ROWS, AV_WEIGHTS_PATH,
+    LGBM_PARAMS, EARLY_STOPPING_ROUNDS,
 )
 from cache import cache_path, feature_cache_key, load_from_cache, save_to_cache
-from data_pipeline import (
-    load_and_aggregate_daily_to_weekly,
-    construct_lag_features,
-    get_feature_columns,
-    save_feature_columns,
+from data_pipeline import load_and_aggregate_daily_to_weekly, construct_anchor_rows
+from features_score import (
+    add_calendar_features, compute_region_stats, add_region_features,
+    compute_score_climatology, add_score_climatology,
+    add_score_lag1_train, compute_region_last_score,
+    REGION_STATS_PATH, SCORE_CLIMATOLOGY_PATH, REGION_LAST_SCORE_PATH,
+    CALENDAR_FEATURE_COLS, REGION_FEATURE_COLS, SCORE_CLIM_FEATURE_COLS,
+    SCORE_LAG_FEATURE_COLS,
 )
-from features import (
-    add_temporal_features,
-    add_region_features,
-    compute_region_stats,
-    EXTRA_FEATURE_COLS,
+from features_climate import (
+    compute_climate_climatologies, add_climate_features, CLIMATE_FEATURE_COLS,
+    PRESSURE_CLIMATOLOGY_PATH, METEO_CLIMATOLOGY_PATH,
+    DROUGHT_INDEX_CLIMATOLOGY_PATH, HEAT_CLIMATOLOGY_PATH,
 )
-if USE_EXTRA_FEATURES:
-    from features_extra import (
-        compute_woy_score_climatology,
-        compute_woy_meteo_climatology,
-        add_woy_score_climatology,
-        add_anomaly_features,
-        add_trend_features,
-        add_interaction_features,
-        EXTRA_FEATURE_COLS_V2,
-    )
-if USE_SCORE_LAG_FEATURES:
-    from features_extra import (
-        add_score_lag_features_train,
-        compute_region_last_score_features,
-        SCORE_LAG_COLS,
-    )
-if USE_REGION_CLUSTER_FEATURES:
-    from features_extra import (
-        fit_region_clusters,
-        add_region_cluster_features,
-        CLUSTER_FEATURE_COLS,
-        REGION_CLUSTERS_CSV,
-    )
+from features_windowed import (
+    compute_windowed_climatology, add_windowed_features, windowed_feature_cols,
+    WINDOWED_CLIMATOLOGY_PATH,
+)
+from transition_matrix import (
+    build_transition_matrices, save_transition_matrices, compute_transition_weight,
+)
+from proxy_score import (
+    fit_proxy_ridge, add_proxy_score, meteo_feature_cols, PROXY_FEATURE_COL,
+)
+from pruning import prune_features
+from model import (
+    train_single_horizon, save_all_models, predict_all_horizons,
+    train_horizon_walk_forward, save_fold_models,
+    fit_isotonic_oof, save_calibrator, apply_calibration,
+)
+from zero_inflated import (
+    train_zi_horizon, save_zi_models, predict_zi,
+)
 from validate import (
-    fixed_holdout_split,
-    evaluate_predictions,
-    print_validation_report,
-    walk_forward_diagnostic,
-    calendar_matched_split,
-    compute_test_anchor_woy_per_region,
-    last_anchor_per_region_mask,
-    cluster_stratified_report,
+    fixed_holdout_split, calendar_matched_split,
+    compute_test_anchor_woy_per_region, evaluate_predictions, print_validation_report,
 )
 
 
 # ---------------------------------------------------------------------------
-# Single-model training helpers (L1 LightGBM)
+# Feature build
 # ---------------------------------------------------------------------------
-# Per memory: feedback-dmfp-loss-choice — L1 (median predictor) is the right
-# loss for this MAE-evaluated, 67%-zeros target. Two-stage and Tweedie were
-# tested and both lost to L1 on validation; their code paths have been removed.
 
-from model import train_single_horizon, save_all_models
+def add_all_features(
+    df: pd.DataFrame,
+    weekly_df: pd.DataFrame,
+    region_stats: pd.DataFrame,
+    score_clim: pd.DataFrame,
+    climate_clims: dict | None,
+    windowed_clim: pd.DataFrame | None,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Add every feature block. Returns (extended_df, full_feature_col_list)."""
+    out = add_calendar_features(df)
+    out = add_region_features(out, region_stats)
+    out = add_score_climatology(out, score_clim)
 
+    feat_cols: list[str] = list(CALENDAR_FEATURE_COLS) + list(REGION_FEATURE_COLS) + list(SCORE_CLIM_FEATURE_COLS)
 
-def _make_sample_weight(y_train, av_weights: np.ndarray | None = None) -> np.ndarray:
-    """Severity weight × (optional) adversarial-validation weight.
-
-    Severity weight per-row: 1 + α·𝟙[y>0] + β·𝟙[y≥3]. Upweights severe rows
-    in the L1 gradient. AV weight (Phase 3b) reweights for covariate shift.
-    Final array is renormalized to mean=1 so the effective learning rate
-    is unchanged.
-    """
-    y = np.asarray(y_train, dtype=np.float32)
-    w = (
-        1.0
-        + SAMPLE_WEIGHT_ALPHA * (y > 0).astype(np.float32)
-        + SAMPLE_WEIGHT_BETA * (y >= 3).astype(np.float32)
-    )
-    if av_weights is not None:
-        w = w * np.asarray(av_weights, dtype=np.float32)
-        w = w / w.mean()
-    return w
-
-
-def _apply_calendar_matched_training_filter(
-    train_split: pd.DataFrame,
-    test_woy_per_region: dict,
-    slack_weeks: int,
-    off_season_frac: float,
-    seed: int,
-) -> pd.DataFrame:
-    """Phase 3a — keep all in-season anchors + off_season_frac of off-season
-    anchors. Logs the kept counts; returns a re-indexed DataFrame.
-    """
-    woys = ((train_split["day_of_year"].astype(np.int32) - 1) // 7).clip(0, 52).astype(np.int16).values
-    test_woys = train_split["region_id"].map(test_woy_per_region).astype(np.int16).values
-    dist = np.abs(woys - test_woys)
-    dist = np.minimum(dist, 52 - dist)
-    in_season = dist <= slack_weeks
-
-    rng = np.random.default_rng(seed)
-    off_season_keep = rng.random(len(train_split)) < off_season_frac
-    keep_mask = in_season | (~in_season & off_season_keep)
-
-    kept = train_split[keep_mask].reset_index(drop=True)
-    n_in = int((in_season & keep_mask).sum())
-    n_off = int(((~in_season) & keep_mask).sum())
-    log.info(
-        f"  [phase3a] calendar-matched training filter: "
-        f"{len(kept):,}/{len(train_split):,} kept  "
-        f"(in-season={n_in:,}, off-season tail={n_off:,} @ {off_season_frac*100:.0f}%)"
-    )
-    return kept
-
-
-def _train_one(X_tr, y_tr, X_val, y_val, h, sample_weight=None):
-    return train_single_horizon(
-        X_tr, y_tr, X_val, y_val, horizon=h, sample_weight=sample_weight,
-    )
-
-
-def _predict(model, X):
-    return np.clip(model.predict(X), 0.0, 5.0)
-
-
-def _save(models):
-    save_all_models(models)
-
-
-def _fit_preprocessing_artifacts():
-    """
-    Pass 1 of the daily-level pipeline: scan train (and test, for rank-norm
-    pooled quantiles) to fit imputation medians, p1/p99 winsor bounds, log/sqrt
-    transform spec, and quantile anchors. Save under code/models/ for predict.py.
-    Returns the 4-tuple consumed by data_pipeline.load_and_aggregate_daily_to_weekly.
-    """
-    from preprocessing import (
-        compute_winsor_bounds, compute_imputation_table, compute_rank_quantiles,
-        save_preprocessing_artifacts,
-    )
-
-    log.info("[preproc] Reading train daily for artifact fitting...")
-    train_chunks = []
-    for chunk in pd.read_csv(TRAIN_PATH, dtype={"region_id": str, "date": str},
-                             chunksize=500_000):
-        train_chunks.append(chunk)
-    train_daily = pd.concat(train_chunks, ignore_index=True)
-    log.info(f"[preproc] train_daily: {len(train_daily):,} rows")
-
-    bounds = compute_winsor_bounds(train_daily, q_lo=0.01, q_hi=0.99)
-    imputation_table = compute_imputation_table(train_daily)
-
-    # Skew-driven transforms from Section 8 of the EDA snapshot.
-    log_features = {"prec": "log1p", "surf_pre": "sqrt"}
-
-    quantile_table: dict = {}
-    if USE_RANK_NORMALIZATION:
-        log.info("[preproc] Reading test daily for pooled rank quantiles...")
-        test_daily = pd.read_csv(TEST_PATH, dtype={"region_id": str, "date": str})
-        quantile_table = compute_rank_quantiles(
-            train_daily, test_daily, RANK_NORMALIZE_FEATURES, n_quantiles=1000,
+    # Phase 8: score_lag1 is always computed (the transition-weight code uses
+    # it as the "previous score" reference) but is only added to feature_cols
+    # when USE_SCORE_LAG=True. With USE_SCORE_LAG=False (the Phase 8 default),
+    # the column exists in the DataFrame but the model never sees it.
+    out = add_score_lag1_train(out, weekly_df)
+    if USE_SCORE_LAG:
+        feat_cols += list(SCORE_LAG_FEATURE_COLS)
+    if USE_CLIMATE_FEATURES and climate_clims is not None:
+        out, climate_added = add_climate_features(out, weekly_df, climate_clims)
+        feat_cols += climate_added
+    if USE_WINDOWED_FEATURES and windowed_clim is not None:
+        out, windowed_added = add_windowed_features(
+            out, weekly_df, windowed_clim,
+            channels=WINDOWED_CHANNELS, windows=WINDOWED_WINDOWS,
         )
-        del test_daily
-
-    save_preprocessing_artifacts(bounds, log_features, imputation_table, quantile_table)
-    log.info(f"[preproc] artifacts saved: winsor={len(bounds)} "
-             f"log/sqrt={len(log_features)} imputation_rows={len(imputation_table)} "
-             f"quantile_features={len(quantile_table)}")
-    del train_daily
-    return bounds, log_features, imputation_table, quantile_table
+        feat_cols += windowed_added
+    # Deduplicate while preserving order
+    seen = set()
+    feat_cols = [c for c in feat_cols if not (c in seen or seen.add(c))]
+    return out, feat_cols
 
 
-def _log_run_config():
-    log.info("=" * 70)
-    log.info(f"DMFP training run | model=L1 LightGBM")
-    log.info(f"  USE_PREPROCESSING={USE_PREPROCESSING}  USE_EXTRA_FEATURES={USE_EXTRA_FEATURES}")
-    log.info(f"  USE_SCORE_LAG_FEATURES={USE_SCORE_LAG_FEATURES}  USE_REGION_CLUSTER_FEATURES={USE_REGION_CLUSTER_FEATURES}")
-    log.info(f"  USE_RANK_NORMALIZATION={USE_RANK_NORMALIZATION}  N_REGION_CLUSTERS={N_REGION_CLUSTERS}")
-    log.info(f"  USE_FEATURE_AUDIT_PRUNE={USE_FEATURE_AUDIT_PRUNE}")
-    log.info(f"  USE_CALENDAR_MATCHED_TRAINING={USE_CALENDAR_MATCHED_TRAINING} (off_season_tail={OFF_SEASON_TAIL_FRAC})")
-    log.info(f"  USE_ADVERSARIAL_WEIGHTING={USE_ADVERSARIAL_WEIGHTING} (clip=[{AV_CLIP_LO}, {AV_CLIP_HI}])")
-    log.info(f"  SAMPLE_WEIGHT_ALPHA={SAMPLE_WEIGHT_ALPHA}  SAMPLE_WEIGHT_BETA={SAMPLE_WEIGHT_BETA}")
-    log.info(f"  RUN_WALK_FORWARD_DIAGNOSTIC={RUN_WALK_FORWARD_DIAGNOSTIC}")
-    log.info(f"  log file: {current_log_path()}")
-    log.info("=" * 70)
-
-
-def _build_train_features():
-    """Run stages [0/5]–[3/5]: preprocessing artifacts → weekly aggregation →
-    lag features → temporal/region/extra features. Returns
-    (train_split, val_split, all_feature_cols).
-
-    Side effects: persists per-region artifacts under MODELS_DIR
-    (region_stats.csv, region_clusters.csv, region_last_scores.csv,
-    score_climatology.csv, meteo_climatology.csv, feature_cols.json) that
-    predict.py consumes.
-    """
-    # Stage 0: Fit daily-level preprocessing artifacts (if enabled)
-    preproc_artifacts = None
-    if USE_PREPROCESSING:
-        log.info("[0/5] Fitting daily-level preprocessing artifacts...")
-        t_stage = time.time()
-        preproc_artifacts = _fit_preprocessing_artifacts()
-        log.info(f"[0/5] done in {(time.time() - t_stage) / 60:.2f} min")
-
-    # Stage 1: Load and aggregate
-    log.info("[1/5] Loading and aggregating train daily → weekly...")
-    t_stage = time.time()
-    train_weekly = load_and_aggregate_daily_to_weekly(
-        TRAIN_PATH, is_train=True, preproc_artifacts=preproc_artifacts,
-    )
-    log.info(f"[1/5] train_weekly: {train_weekly.shape}, done in {(time.time() - t_stage) / 60:.2f} min")
-
-    # Stage 2: Construct lag features
-    log.info("[2/5] Constructing lag features...")
-    t_stage = time.time()
-    train_features = construct_lag_features(train_weekly, lag_window=LAG_WINDOW, is_train=True)
-    log.info(f"[2/5] train_features: {train_features.shape}, done in {(time.time() - t_stage) / 60:.2f} min")
-
-    # Stage 3: Add temporal + region features
-    log.info("[3/5] Adding temporal and region features...")
-    t_stage = time.time()
-    if CALENDAR_MATCHED_VALIDATION:
-        test_woy_per_region = compute_test_anchor_woy_per_region(TEST_PATH)
-        woy_series = pd.Series(test_woy_per_region.values())
-        log.info(
-            f"  test_end_woy per region: median={int(woy_series.median())} "
-            f"p25={int(woy_series.quantile(0.25))} p75={int(woy_series.quantile(0.75))} "
-            f"min={int(woy_series.min())} max={int(woy_series.max())} (n={len(woy_series)})"
-        )
-        train_split, val_split = calendar_matched_split(
-            train_features,
-            test_woy_per_region=test_woy_per_region,
-            slack_weeks=CALENDAR_MATCHED_SLACK_WEEKS,
-            last_year_only=CALENDAR_MATCHED_LAST_YEAR_ONLY,
-        )
-        log.info(f"  calendar_matched_split → train: {len(train_split):,}  val: {len(val_split):,}")
-    else:
-        test_woy_per_region = None
-        train_split, val_split = fixed_holdout_split(train_features)
-        log.info(f"  fixed_holdout_split → train: {len(train_split):,}  val: {len(val_split):,}")
-
-    max_train_anchor = train_split["week_idx"].max()
-    train_weekly_for_stats = train_weekly[train_weekly["week_idx"] <= max_train_anchor]
-    region_stats = compute_region_stats(train_weekly_for_stats)
-
-    train_split = add_temporal_features(train_split)
-    train_split = add_region_features(train_split, region_stats)
-    val_split = add_temporal_features(val_split)
-    val_split = add_region_features(val_split, region_stats)
-
-    extra_cols: list = []
-    if USE_EXTRA_FEATURES:
-        log.info("  Computing woy climatologies on training-fold weekly rows...")
-        score_clim = compute_woy_score_climatology(train_weekly_for_stats)
-        meteo_clim = compute_woy_meteo_climatology(train_weekly_for_stats)
-        score_clim.to_csv(MODELS_DIR / "score_climatology.csv", index=False)
-        meteo_clim.to_csv(MODELS_DIR / "meteo_climatology.csv", index=False)
-        log.info(f"  Score climatology: {score_clim.shape};  meteo climatology: {meteo_clim.shape}")
-
-        for df_name, df_ in [("train", train_split), ("val", val_split)]:
-            df_ = add_woy_score_climatology(df_, score_clim)
-            df_ = add_anomaly_features(df_, meteo_clim)
-            df_ = add_trend_features(df_)
-            df_ = add_interaction_features(df_)
-            if df_name == "train":
-                train_split = df_
-            else:
-                val_split = df_
-        extra_cols = list(EXTRA_FEATURE_COLS_V2)
-
-    if USE_SCORE_LAG_FEATURES:
-        log.info("  Adding lagged-score features (Section 10 mitigation)...")
-        train_split = add_score_lag_features_train(train_split, train_weekly)
-        val_split = add_score_lag_features_train(val_split, train_weekly)
-        region_last_scores = compute_region_last_score_features(train_weekly)
-        region_last_scores.to_csv(MODELS_DIR / "region_last_scores.csv", index=False)
-        extra_cols = extra_cols + SCORE_LAG_COLS
-
-    if USE_REGION_CLUSTER_FEATURES:
-        log.info(f"  Fitting region clusters (k={N_REGION_CLUSTERS})...")
-        cluster_table = fit_region_clusters(
-            train_weekly_for_stats, n_clusters=N_REGION_CLUSTERS,
-        )
-        cluster_table.to_csv(REGION_CLUSTERS_CSV, index=False)
-        train_split = add_region_cluster_features(train_split, cluster_table)
-        val_split = add_region_cluster_features(val_split, cluster_table)
-        extra_cols = extra_cols + CLUSTER_FEATURE_COLS
-
-    lag_feature_cols = get_feature_columns()
-    all_feature_cols = lag_feature_cols + EXTRA_FEATURE_COLS + extra_cols
-
-    # Phase 2 — audit prune. Apply the gain-ranked top-70% allowlist from
-    # feature_cols_pruned.json (generated from the Phase 1b models), with
-    # an automatic carve-out for new feature blocks that didn't exist when
-    # the prune list was built (currently the *_p95_lag0 tail-intensity
-    # columns from the Phase 2 STAT_SUFFIXES extension).
-    if USE_FEATURE_AUDIT_PRUNE:
-        import json as _json
-        if PRUNED_FEATURE_LIST_PATH.is_file():
-            with open(PRUNED_FEATURE_LIST_PATH) as f:
-                pruned_keep = set(_json.load(f))
-            new_block = [c for c in all_feature_cols
-                         if c not in pruned_keep and "_p95_" in c]
-            kept = [c for c in all_feature_cols if c in pruned_keep or c in new_block]
-            log.info(
-                f"  [audit] {len(kept)}/{len(all_feature_cols)} features kept "
-                f"(prune-list ∩ built: {len(kept) - len(new_block)}; new block carve-out: {len(new_block)})"
-            )
-            all_feature_cols = kept
-        else:
-            log.warning(
-                f"  [audit] USE_FEATURE_AUDIT_PRUNE=True but {PRUNED_FEATURE_LIST_PATH} "
-                f"missing — using all {len(all_feature_cols)} features"
-            )
-
-    save_feature_columns(all_feature_cols)
-
-    region_stats.to_csv(MODELS_DIR / "region_stats.csv", index=False)
-    log.info(f"  Region stats saved → {MODELS_DIR / 'region_stats.csv'}")
-    log.info(f"[3/5] done in {(time.time() - t_stage) / 60:.2f} min")
-
-    return train_split, val_split, all_feature_cols
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     t0 = time.time()
-    _log_run_config()
+    log.info("=" * 70)
+    log.info("Phase 8 training")
+    log.info("=" * 70)
+    log.info(
+        f"  USE_PROXY_SCORE={USE_PROXY_SCORE}  USE_SCORE_LAG={USE_SCORE_LAG}  "
+        f"USE_CLIMATE_FEATURES={USE_CLIMATE_FEATURES}  USE_WINDOWED_FEATURES={USE_WINDOWED_FEATURES}"
+    )
+    log.info(
+        f"  USE_METEO_CLUSTER={USE_METEO_CLUSTER}  USE_TRANSITION_SMOOTHING={USE_TRANSITION_SMOOTHING}  "
+        f"USE_TRANSITION_WEIGHT={USE_TRANSITION_WEIGHT}  USE_SEVERITY_WEIGHT={USE_SEVERITY_WEIGHT}"
+    )
+    log.info(
+        f"  LGBM objective={LGBM_PARAMS['objective']}  n_estimators={LGBM_PARAMS['n_estimators']}  "
+        f"lr={LGBM_PARAMS['learning_rate']}"
+    )
 
-    # ------------------------------------------------------------------
-    # Cache check: skip stages [0/5]–[3/5] when feature config + raw data
-    # are unchanged. On hit we also require feature_cols.json on disk so
-    # predict.py has the column ordering to match.
-    # ------------------------------------------------------------------
     key = feature_cache_key()
     log.info(f"[cache] key={key}  path={cache_path('train_features', key)}")
-    cached = load_from_cache("train_features", key)
-    artifacts_present = (MODELS_DIR / "feature_cols.json").is_file()
 
-    if cached is not None and artifacts_present:
-        log.info(f"[cache] hit: skipping [0/5]–[3/5] (saved ~4.7 min)")
+    cached = load_from_cache("train_features", key)
+    if cached is not None:
+        log.info("[cache] HIT — using cached train/val features")
         train_split = cached["train_split"]
         val_split = cached["val_split"]
-        all_feature_cols = cached["all_feature_cols"]
+        feature_cols = cached["feature_cols"]
+        weekly_df_full = cached["weekly_df_full"]   # for transition matrices
     else:
-        if cached is None:
-            log.info(f"[cache] miss: rebuilding features")
+        log.info("[cache] MISS — rebuilding features")
+        # Stage 0: preprocessing artifacts. Prefer the on-disk artifacts if they
+        # exist (they're built once and reused — the daily preprocessing isn't
+        # part of the Phase 7 feature philosophy change). Otherwise fit them
+        # from train+test daily rows.
+        preproc_artifacts = None
+        if USE_PREPROCESSING:
+            from preprocessing import (
+                compute_winsor_bounds, compute_imputation_table, compute_rank_quantiles,
+                save_preprocessing_artifacts, load_preprocessing_artifacts,
+                PREPROC_JSON,
+            )
+            if PREPROC_JSON.exists():
+                log.info("[stage 0] loading existing preprocessing artifacts")
+                preproc_artifacts = load_preprocessing_artifacts()
+            else:
+                log.info("[stage 0] fitting preprocessing artifacts from train+test daily rows")
+                from config import METEO_FEATURES
+                train_daily = pd.read_csv(
+                    TRAIN_PATH, usecols=["region_id"] + list(METEO_FEATURES))
+                test_daily = pd.read_csv(
+                    TEST_PATH, usecols=["region_id"] + list(METEO_FEATURES))
+                bounds = compute_winsor_bounds(train_daily)
+                log_features: dict[str, str] = {}
+                imp = compute_imputation_table(train_daily)
+                qt = (
+                    compute_rank_quantiles(train_daily, test_daily, list(RANK_NORMALIZE_FEATURES))
+                    if USE_RANK_NORMALIZATION else {}
+                )
+                save_preprocessing_artifacts(bounds, log_features, imp, qt)
+                preproc_artifacts = (bounds, log_features, imp, qt)
+                del train_daily, test_daily
+
+        # Stage 1: daily → weekly
+        log.info("[stage 1] daily → weekly")
+        train_weekly = load_and_aggregate_daily_to_weekly(
+            TRAIN_PATH, is_train=True, preproc_artifacts=preproc_artifacts,
+        )
+
+        # Stage 2: anchor rows
+        log.info("[stage 2] building anchor rows")
+        train_features = construct_anchor_rows(train_weekly, is_train=True, lag_window=LAG_WINDOW)
+
+        # Train/val split (calendar-matched preferred)
+        if CALENDAR_MATCHED_VALIDATION:
+            test_woy_per_region = compute_test_anchor_woy_per_region(TEST_PATH)
+            train_split, val_split = calendar_matched_split(
+                train_features, test_woy_per_region,
+                slack_weeks=CALENDAR_MATCHED_SLACK_WEEKS,
+                last_year_only=CALENDAR_MATCHED_LAST_YEAR_ONLY,
+            )
         else:
-            log.info(f"[cache] hit but feature_cols.json missing — rebuilding")
-        train_split, val_split, all_feature_cols = _build_train_features()
+            train_split, val_split = fixed_holdout_split(train_features)
+        log.info(f"  train: {len(train_split):,}  val: {len(val_split):,}")
+
+        # Stage 3: features (climatologies fit on train-fold rows only)
+        max_train_anchor = int(train_split["week_idx"].max())
+        train_weekly_fold = train_weekly[train_weekly["week_idx"] <= max_train_anchor]
+        log.info(f"[stage 3] climatologies on training fold ({len(train_weekly_fold):,} weekly rows)")
+
+        region_stats = compute_region_stats(train_weekly_fold)
+        score_clim = compute_score_climatology(train_weekly_fold)
+        region_stats.to_csv(REGION_STATS_PATH, index=False)
+        score_clim.to_csv(SCORE_CLIMATOLOGY_PATH, index=False)
+
+        climate_clims = None
+        if USE_CLIMATE_FEATURES:
+            climate_clims = compute_climate_climatologies(train_weekly_fold)
+            climate_clims["pressure"].to_csv(PRESSURE_CLIMATOLOGY_PATH, index=False)
+            climate_clims["meteo"].to_csv(METEO_CLIMATOLOGY_PATH, index=False)
+            climate_clims["drought_index"].to_csv(DROUGHT_INDEX_CLIMATOLOGY_PATH, index=False)
+            if climate_clims.get("heat") is not None:
+                climate_clims["heat"].to_csv(HEAT_CLIMATOLOGY_PATH, index=False)
+            log.info(
+                f"  climate climatology shapes: pressure {climate_clims['pressure'].shape}, "
+                f"meteo {climate_clims['meteo'].shape}, drought_index {climate_clims['drought_index'].shape}"
+            )
+
+        windowed_clim = None
+        if USE_WINDOWED_FEATURES:
+            log.info("  Computing windowed climatology (slow: O(regions × weeks × windows × stats))...")
+            windowed_clim = compute_windowed_climatology(
+                train_weekly_fold, channels=WINDOWED_CHANNELS, windows=WINDOWED_WINDOWS,
+            )
+            windowed_clim.to_csv(WINDOWED_CLIMATOLOGY_PATH, index=False)
+            log.info(f"  windowed climatology: {windowed_clim.shape}")
+
+        # Region last scores (for predict.py)
+        region_last = compute_region_last_score(train_weekly)
+        region_last.to_csv(REGION_LAST_SCORE_PATH, index=False)
+
+        # Stage 3b: apply features to both splits
+        log.info("[stage 3b] applying features to train/val splits")
+        train_split, feature_cols = add_all_features(
+            train_split, train_weekly, region_stats, score_clim, climate_clims, windowed_clim,
+        )
+        val_split, _ = add_all_features(
+            val_split, train_weekly, region_stats, score_clim, climate_clims, windowed_clim,
+        )
+        log.info(f"  feature_cols total: {len(feature_cols)}")
+
+        weekly_df_full = train_weekly
         save_to_cache(
-            {
-                "train_split": train_split,
-                "val_split": val_split,
-                "all_feature_cols": all_feature_cols,
-            },
+            {"train_split": train_split, "val_split": val_split,
+             "feature_cols": feature_cols, "weekly_df_full": weekly_df_full},
             "train_features", key,
         )
-        log.info(f"[cache] saved → {cache_path('train_features', key)}")
 
-    # ------------------------------------------------------------------
-    # Phase 3 — covariate-shift correction
-    #   3b (first): fit AV classifier on the *unfiltered* train_split so it
-    #               sees the full off-season distribution
-    #   3a:        apply calendar-matched training filter to train_split
-    #   3b (then): compute per-row AV weights aligned to the filtered rows
-    # Both knobs are training-only and don't affect the feature cache.
-    # ------------------------------------------------------------------
-    av_weights = None
-    av_model = None
-    av_cols: list = []
-    if USE_ADVERSARIAL_WEIGHTING or USE_CALENDAR_MATCHED_TRAINING:
-        test_woy_per_region = compute_test_anchor_woy_per_region(TEST_PATH)
+    # Stage 3c — Phase 8 proxy score. Fit AFTER feature build / cache load,
+    # BEFORE saving feature_cols.json so the order is stable across train and predict.
+    if USE_PROXY_SCORE:
+        log.info("[stage 3c] fitting proxy Ridge on meteo features → target_w1")
+        proxy_input_cols = [c for c in meteo_feature_cols() if c in train_split.columns]
+        proxy_model, proxy_used_cols, train_rho = fit_proxy_ridge(
+            train_split, target_col="target_w1", feature_cols=proxy_input_cols,
+        )
+        log.info(
+            f"  proxy_ridge alpha={proxy_model.alpha_:.4g}  "
+            f"features_used={len(proxy_used_cols)}  "
+            f"train Spearman ρ(proxy_score, target_w1)={train_rho:.4f}"
+        )
+        train_split = add_proxy_score(train_split, proxy_model, proxy_used_cols)
+        val_split = add_proxy_score(val_split, proxy_model, proxy_used_cols)
+        if PROXY_FEATURE_COL not in feature_cols:
+            feature_cols = feature_cols + [PROXY_FEATURE_COL]
+
+    # Phase 8: drop score_lag1 from feature_cols when USE_SCORE_LAG=False.
+    # The column is still in train_split for the transition-weight code; only
+    # the model never sees it.
+    if not USE_SCORE_LAG:
+        feature_cols = [c for c in feature_cols if c not in SCORE_LAG_FEATURE_COLS]
+
+    # Optional meteo cluster feature (gated on diagnostic having produced the table).
+    if USE_METEO_CLUSTER:
+        cluster_path = MODELS_DIR / "meteo_cluster_table.csv"
+        if cluster_path.exists():
+            cluster_table = pd.read_csv(cluster_path)[["region_id", "meteo_cluster_id"]]
+            train_split = train_split.merge(cluster_table, on="region_id", how="left")
+            val_split = val_split.merge(cluster_table, on="region_id", how="left")
+            train_split["meteo_cluster_id"] = train_split["meteo_cluster_id"].fillna(-1).astype(np.int32)
+            val_split["meteo_cluster_id"] = val_split["meteo_cluster_id"].fillna(-1).astype(np.int32)
+            if "meteo_cluster_id" not in feature_cols:
+                feature_cols = feature_cols + ["meteo_cluster_id"]
+            log.info(
+                f"  meteo_cluster_id added ({cluster_path}, "
+                f"K={cluster_table['meteo_cluster_id'].nunique()})"
+            )
+        else:
+            log.info(f"  USE_METEO_CLUSTER=True but {cluster_path} not found — skipping cluster feature")
+
+    # Stage 4 — optional pruning
+    if USE_PRUNING:
+        log.info("[stage 4] aggressive collinearity pruning")
+        # Use the val split's feature matrix as the "test-like" set for AV importance
+        # (real test features aren't available at training time).
+        X_train = train_split[feature_cols].to_numpy(np.float32)
+        X_val = val_split[feature_cols].to_numpy(np.float32)
+        y = train_split["target_w1"].to_numpy(np.float32)
+        hard_keep = list(SCORE_LAG_FEATURE_COLS) + list(REGION_FEATURE_COLS) + list(CALENDAR_FEATURE_COLS)
+        kept, report = prune_features(
+            X_train, X_val, y, feature_cols, hard_keep,
+            output_path=LEAN_FEATURE_LIST_PATH,
+            correlation_threshold=PRUNING_CORRELATION_THRESHOLD,
+            vif_threshold=PRUNING_VIF_THRESHOLD,
+        )
+        log.info(f"  pruning: {len(feature_cols)} → {len(kept)} features")
+        log.info(f"  pruning report: {report}")
+        feature_cols = kept
+
+    # Save the final feature_cols.json so predict.py can align columns
+    with open(MODELS_DIR / "feature_cols.json", "w") as f:
+        json.dump(feature_cols, f, indent=2)
+    log.info(f"  feature_cols saved → {MODELS_DIR / 'feature_cols.json'}")
+
+    # Stage 4b — drought transition matrices (built BEFORE LGBM so they can
+    # provide sample weights). Always built when USE_TRANSITION_SMOOTHING or
+    # USE_TRANSITION_WEIGHT is on.
+    matrices = None
+    cluster_assignment = None
+    if USE_TRANSITION_SMOOTHING or USE_TRANSITION_WEIGHT:
+        log.info("[stage 4b] building drought transition matrices")
+        matrices, cluster_assignment = build_transition_matrices(
+            weekly_df_full, n_clusters=TRANSITION_CLUSTERS,
+            smoothing_alpha=TRANSITION_SMOOTHING_ALPHA,
+        )
+        save_transition_matrices(
+            matrices, cluster_assignment,
+            horizons=list(HORIZONS), score_levels=list(range(6)),
+        )
+        log.info(f"  transition matrices saved: shape {matrices.shape}")
+
+    # Stage 4c — compute per-row sample weights over the COMBINED dataset
+    # (train_split + val_split). Walk-forward CV sees both, so weights must
+    # be aligned to the same row order.
+    combined_split = pd.concat([train_split, val_split], ignore_index=True)
+    val_mask = np.concatenate([
+        np.zeros(len(train_split), dtype=bool),
+        np.ones(len(val_split), dtype=bool),
+    ])
+    log.info(f"  combined dataset: {len(combined_split):,} rows "
+             f"(train={len(train_split):,}, val={len(val_split):,})")
+
+    sample_weight = None
+    if USE_TRANSITION_WEIGHT and matrices is not None and "score_lag1" in combined_split.columns:
+        cluster_ids = np.zeros(len(combined_split), dtype=np.int32)
+        if cluster_assignment is not None and len(cluster_assignment) > 0:
+            cluster_ids = (
+                combined_split["region_id"].astype(str)
+                .map(cluster_assignment).fillna(0).astype(int).to_numpy()
+            )
+        sample_weight = compute_transition_weight(
+            score_lag1=combined_split["score_lag1"].to_numpy(),
+            score=combined_split["target_w1"].to_numpy(),
+            cluster_ids=cluster_ids,
+            matrices=matrices,
+            horizon=1,
+            horizons=list(HORIZONS),
+            score_levels=list(range(6)),
+            gamma=TRANSITION_WEIGHT_GAMMA,
+        )
+        log.info(f"  transition sample_weight: "
+                 f"mean={float(sample_weight.mean()):.3f}  std={float(sample_weight.std()):.3f}  "
+                 f"min={float(sample_weight.min()):.3f}  max={float(sample_weight.max()):.3f}")
+
+    if USE_SEVERITY_WEIGHT:
+        y = combined_split["target_w1"].to_numpy(np.float32)
+        sev = (
+            1.0
+            + SAMPLE_WEIGHT_ALPHA * (y > 0).astype(np.float32)
+            + SAMPLE_WEIGHT_BETA * (y >= 3).astype(np.float32)
+        )
+        sample_weight = sev if sample_weight is None else (sample_weight * sev)
+        sample_weight = (sample_weight / sample_weight.mean()).astype(np.float32)
+        log.info(
+            f"  severity weight applied (α={SAMPLE_WEIGHT_ALPHA}, β={SAMPLE_WEIGHT_BETA}).  "
+            f"final sample_weight: mean=1.000  std={float(sample_weight.std()):.3f}  "
+            f"min={float(sample_weight.min()):.3f}  max={float(sample_weight.max()):.3f}"
+        )
+
+    # Stage 5 — Phase 10 walk-forward CV (or legacy single-split training).
+    X_combined = combined_split[feature_cols]
+    time_keys = combined_split["week_idx"].to_numpy(np.int32)
+
+    if USE_ZERO_INFLATED:
+        # Legacy two-stage path; not used by Phase 10 default config.
+        log.info(
+            f"[stage 5] training zero-inflated two-stage (legacy)  "
+            f"({len(HORIZONS)} × 2 LightGBM models)"
+        )
+        zi_models = {}
+        oof = np.full((len(combined_split), len(HORIZONS)), np.nan, dtype=np.float32)
+        X_tr_legacy = train_split[feature_cols]
+        X_va_legacy = val_split[feature_cols]
+        for i, h in enumerate(HORIZONS):
+            log.info(f"--- horizon {h} (zero-inflated) ---")
+            clf, reg = train_zi_horizon(
+                X_tr_legacy, train_split[f"target_w{h}"],
+                X_va_legacy, val_split[f"target_w{h}"],
+                horizon=h,
+                sample_weight=sample_weight[~val_mask] if sample_weight is not None else None,
+            )
+            zi_models[h] = (clf, reg)
+            preds = predict_zi({h: (clf, reg)}, X_va_legacy)[h]
+            oof[val_mask, i] = np.clip(preds, 0.0, 5.0)
+        save_zi_models(zi_models)
+        save_calibrator(None)  # no calibration in legacy path
+    elif USE_WALK_FORWARD_CV:
+        log.info(
+            f"[stage 5] walk-forward CV  "
+            f"folds={N_WF_FOLDS}  purge_weeks={WF_PURGE_WEEKS}  "
+            f"objective={LGBM_PARAMS.get('objective')}  "
+            f"sample_weight={'on' if sample_weight is not None else 'off'}"
+        )
+        fold_models_by_horizon: dict[int, list] = {}
+        oof = np.full((len(combined_split), len(HORIZONS)), np.nan, dtype=np.float32)
+        for i, h in enumerate(HORIZONS):
+            log.info(f"--- horizon {h} (walk-forward) ---")
+            y_h = combined_split[f"target_w{h}"]
+            fold_models, oof_h = train_horizon_walk_forward(
+                X_combined, y_h, time_keys,
+                horizon=h, sample_weight=sample_weight,
+                n_folds=N_WF_FOLDS, purge_weeks=WF_PURGE_WEEKS,
+            )
+            fold_models_by_horizon[h] = fold_models
+            oof[:, i] = oof_h
+        save_fold_models(fold_models_by_horizon)
+
+        # Fit a single global IsotonicRegression on (all-horizons OOF, all-horizons y).
+        if USE_ISOTONIC_CALIBRATION:
+            y_concat = np.concatenate([
+                combined_split[f"target_w{h}"].to_numpy(np.float32) for h in HORIZONS
+            ])
+            oof_concat = oof.reshape(-1, order="F")
+            calibrator = fit_isotonic_oof(oof_concat, y_concat)
+            save_calibrator(calibrator)
+        else:
+            calibrator = None
+            save_calibrator(None)
     else:
-        test_woy_per_region = None
-
-    if USE_ADVERSARIAL_WEIGHTING:
-        from adversarial import (
-            make_av_labels, fit_av_classifier, compute_av_weights,
-            effective_sample_size, select_lag0_meteo_cols,
-        )
-        av_cols = select_lag0_meteo_cols(all_feature_cols)
         log.info(
-            f"  [phase3b] fitting AV classifier on {len(train_split):,} pre-filter "
-            f"train rows × {len(av_cols)} lag-0 meteo features..."
+            f"[stage 5] legacy single-split training  "
+            f"({len(HORIZONS)} LightGBM models)"
         )
-        av_labels = make_av_labels(
-            train_split, test_woy_per_region, CALENDAR_MATCHED_SLACK_WEEKS,
-        )
-        av_model, av_auc = fit_av_classifier(
-            train_split, av_labels, av_cols,
-            max_train=AV_CLASSIFIER_MAX_TRAIN_ROWS, seed=42, log_fn=log.info,
-        )
-        if av_auc < 0.65:
-            log.warning(
-                f"  [phase3b] AV AUC={av_auc:.3f} < 0.65 — distribution shift on "
-                f"meteo lag-0 is weak; weights may not help"
+        models = {}
+        oof = np.full((len(combined_split), len(HORIZONS)), np.nan, dtype=np.float32)
+        X_tr_legacy = train_split[feature_cols]
+        X_va_legacy = val_split[feature_cols]
+        for i, h in enumerate(HORIZONS):
+            log.info(f"--- horizon {h} ---")
+            model = train_single_horizon(
+                X_tr_legacy, train_split[f"target_w{h}"],
+                X_va_legacy, val_split[f"target_w{h}"],
+                horizon=h,
+                sample_weight=sample_weight[~val_mask] if sample_weight is not None else None,
             )
+            models[h] = model
+            oof[val_mask, i] = np.clip(model.predict(X_va_legacy), 0.0, 5.0)
+        save_all_models(models)
+        save_calibrator(None)
 
-    if USE_CALENDAR_MATCHED_TRAINING:
-        train_split = _apply_calendar_matched_training_filter(
-            train_split, test_woy_per_region,
-            slack_weeks=CALENDAR_MATCHED_SLACK_WEEKS,
-            off_season_frac=OFF_SEASON_TAIL_FRAC,
-            seed=CALENDAR_MATCHED_TRAINING_SEED,
+    # ── Reporting: OOF MAE (raw and calibrated), val-slice MAE ───────────────
+    from model import load_calibrator
+    cal = load_calibrator()
+    oof_clip = np.clip(oof, 0.0, 5.0).astype(np.float32)
+    oof_cal = apply_calibration(oof_clip, cal)
+
+    horizon_maes_raw: dict[int, float] = {}
+    horizon_maes_cal: dict[int, float] = {}
+    horizon_maes_val_cal: dict[int, float] = {}
+    for i, h in enumerate(HORIZONS):
+        y_true = combined_split[f"target_w{h}"].to_numpy(np.float32)
+        m = np.isfinite(oof[:, i])
+        horizon_maes_raw[h] = float(np.mean(np.abs(oof_clip[m, i] - y_true[m]))) if m.any() else float("nan")
+        horizon_maes_cal[h] = float(np.mean(np.abs(oof_cal[m, i] - y_true[m]))) if m.any() else float("nan")
+        m_v = m & val_mask
+        horizon_maes_val_cal[h] = (
+            float(np.mean(np.abs(oof_cal[m_v, i] - y_true[m_v]))) if m_v.any() else float("nan")
         )
 
-    if USE_ADVERSARIAL_WEIGHTING and av_model is not None:
-        from adversarial import compute_av_weights, effective_sample_size
-        av_weights, av_probs = compute_av_weights(
-            av_model, train_split, av_cols, AV_CLIP_LO, AV_CLIP_HI,
-        )
-        ess, ess_frac = effective_sample_size(av_weights)
-        log.info(
-            f"  [phase3b] AV weights: n={len(av_weights):,}  "
-            f"mean={av_weights.mean():.3f}  std={av_weights.std():.3f}  "
-            f"min={av_weights.min():.3f}  max={av_weights.max():.3f}  "
-            f"ESS/N={ess_frac:.3f}"
-        )
-        if ess_frac < 0.30:
-            log.warning(
-                f"  [phase3b] ESS/N={ess_frac:.3f} < 0.30 — weighting too aggressive. "
-                f"Tighten AV_CLIP_HI or disable USE_ADVERSARIAL_WEIGHTING."
-            )
-        pd.DataFrame({
-            "region_id": train_split["region_id"].values,
-            "week_idx": train_split["week_idx"].values,
-            "av_prob": av_probs,
-            "av_weight": av_weights,
-        }).to_csv(AV_WEIGHTS_PATH, index=False)
-        log.info(f"  [phase3b] weights saved → {AV_WEIGHTS_PATH}")
+    macro_raw = float(np.mean([v for v in horizon_maes_raw.values() if np.isfinite(v)]))
+    macro_cal = float(np.mean([v for v in horizon_maes_cal.values() if np.isfinite(v)]))
+    macro_val_cal = float(np.mean([v for v in horizon_maes_val_cal.values() if np.isfinite(v)]))
 
-    X_train = train_split[all_feature_cols]
-    X_val = val_split[all_feature_cols]
-    log.info(f"  X_train: {X_train.shape}, X_val: {X_val.shape}")
-
-    # ------------------------------------------------------------------
-    # Stage 4: Train per-horizon models
-    # ------------------------------------------------------------------
-    log.info(f"[4/5] Training {len(HORIZONS)} L1 LightGBM models (one per horizon)...")
-    t_stage = time.time()
-    models = {}
+    log.info("=" * 60)
+    log.info("OOF metrics (full combined dataset):")
     for h in HORIZONS:
-        log.info(f"  → starting horizon {h}")
-        t_h = time.time()
-        y_train = train_split[f"target_w{h}"]
-        y_val_h = val_split[f"target_w{h}"]
-        sw = _make_sample_weight(y_train, av_weights=av_weights)
-        models[h] = _train_one(X_train, y_train, X_val, y_val_h, h, sample_weight=sw)
-        log.info(f"  → horizon {h} done in {(time.time() - t_h) / 60:.2f} min")
-    log.info(f"[4/5] all horizons trained in {(time.time() - t_stage) / 60:.2f} min")
+        log.info(f"  h={h}  raw_mae={horizon_maes_raw[h]:.4f}  cal_mae={horizon_maes_cal[h]:.4f}")
+    log.info(f"  MACRO  raw={macro_raw:.4f}  cal={macro_cal:.4f}")
+    log.info(f"OOF metrics (calendar-matched val slice only, calibrated):")
+    for h in HORIZONS:
+        log.info(f"  h={h}  cal_mae={horizon_maes_val_cal[h]:.4f}")
+    log.info(f"  MACRO  cal={macro_val_cal:.4f}")
+    log.info("=" * 60)
 
-    # ------------------------------------------------------------------
-    # Validate + persist
-    # ------------------------------------------------------------------
-    log.info("[5/5] Evaluating on validation set...")
-    val_preds = {h: _predict(models[h], X_val) for h in HORIZONS}
-    macro_mae, horizon_maes = evaluate_predictions(val_split, val_preds)
-    print_validation_report(macro_mae, horizon_maes)
-    log.info(f"  macro val MAE = {macro_mae:.4f}  "
-             f"per-horizon = {{{', '.join(f'w{h}={horizon_maes[h]:.4f}' for h in HORIZONS)}}}")
-
-    # Test-shape val subset: 1 anchor/region. Kaggle scores 1 anchor per
-    # region; the broad macro-MAE over many anchors per region is
-    # structurally optimistic. When calendar-matched validation is active we
-    # pick the val anchor whose woy is closest to that region's test_end_woy
-    # — the higher-fidelity Kaggle proxy.
-    if CALENDAR_MATCHED_VALIDATION:
-        test_woy_per_region = compute_test_anchor_woy_per_region(TEST_PATH)
-        la_mask = last_anchor_per_region_mask(val_split, test_woy_per_region)
-        la_val = val_split.loc[la_mask].reset_index(drop=True)
-        la_preds = {h: val_preds[h][la_mask] for h in HORIZONS}
-        la_macro_mae, la_horizon_maes = evaluate_predictions(la_val, la_preds)
-        log.info(
-            f"  last-anchor-per-region (n={len(la_val):,}) macro MAE = {la_macro_mae:.4f}  "
-            f"per-horizon = {{{', '.join(f'w{h}={la_horizon_maes[h]:.4f}' for h in HORIZONS)}}}"
-        )
-    else:
-        last_anchor = int(val_split["week_idx"].max())
-        la_mask = val_split["week_idx"].values == last_anchor
-        la_val = val_split.loc[la_mask]
-        la_preds = {h: val_preds[h][la_mask] for h in HORIZONS}
-        la_macro_mae, la_horizon_maes = evaluate_predictions(la_val, la_preds)
-        log.info(f"  last-anchor (week={last_anchor}, n={len(la_val):,}) macro MAE = {la_macro_mae:.4f}  "
-                 f"per-horizon = {{{', '.join(f'w{h}={la_horizon_maes[h]:.4f}' for h in HORIZONS)}}}")
-
-    # Per-cluster MAE: the high-severity archetype cluster (363 regions)
-    # carries most of the macro-MAE. Later phases must improve THAT cluster,
-    # not just the easy ones. Reading the cluster table from disk avoids a
-    # re-fit on every run.
-    cluster_csv = MODELS_DIR / "region_clusters.csv"
-    if USE_REGION_CLUSTER_FEATURES and cluster_csv.is_file():
-        cluster_table = pd.read_csv(cluster_csv, dtype={"region_id": str})
-        cluster_report = cluster_stratified_report(val_split, val_preds, cluster_table)
-        log.info("  Per-cluster val MAE (sorted hardest-first):")
-        log.info("    " + cluster_report.to_string(index=False).replace("\n", "\n    "))
-        cluster_report.to_csv(MODELS_DIR.parent / "diagnostics" / "per_cluster_mae.csv", index=False)
-
-    maes = [horizon_maes[h] for h in HORIZONS]
-    if not all(maes[i] <= maes[i + 1] + 0.05 for i in range(len(maes) - 1)):
-        log.warning("MAE is not strictly monotone across horizons (may indicate feature issue)")
-
-    # Save validation predictions for ensembling later. One file per method.
-    preds_arr = np.stack([val_preds[h] for h in HORIZONS], axis=1).astype(np.float32)
-    truth_arr = np.stack(
-        [val_split[f"target_w{h}"].values for h in HORIZONS], axis=1
-    ).astype(np.float32)
-    np.savez(
-        MODELS_DIR / "val_preds.npz",
-        preds=preds_arr,
-        truth=truth_arr,
-        region_ids=val_split["region_id"].values.astype(str),
-        week_idx=val_split["week_idx"].values.astype(np.int32),
-        horizons=np.array(HORIZONS, dtype=np.int32),
+    # Persist OOF for downstream diagnostics
+    y_matrix = np.stack(
+        [combined_split[f"target_w{h}"].to_numpy(np.float32) for h in HORIZONS], axis=1,
     )
-    log.info(f"  Validation predictions saved → val_preds.npz")
+    oof_path = MODELS_DIR / "oof_preds.npz"
+    np.savez(
+        oof_path,
+        oof_raw=oof,
+        oof_clip=oof_clip,
+        oof_cal=oof_cal,
+        y=y_matrix,
+        val_mask=val_mask,
+        week_idx=time_keys,
+        region_id=combined_split["region_id"].astype(str).to_numpy(),
+        horizons=np.array(list(HORIZONS), dtype=np.int32),
+    )
+    log.info(f"  OOF predictions saved → {oof_path}")
 
-    _save(models)
-
-    if RUN_WALK_FORWARD_DIAGNOSTIC:
-        log.info(f"[diagnostic] Walk-forward CV across "
-                 f"{len(WALK_FORWARD_FOLD_BOUNDARIES)} fold boundaries (faster params)...")
-        full_features = pd.concat([train_split, val_split], ignore_index=True)
-        wf = walk_forward_diagnostic(
-            features_df=full_features,
-            feature_cols=all_feature_cols,
-            fold_boundaries=WALK_FORWARD_FOLD_BOUNDARIES,
-            train_one_fn=_train_one,
-            sample_weight_fn=_make_sample_weight,
-            n_estimators_override=1000,
-        )
-        log.info(f"[diagnostic] walk-forward avg macro-MAE: {wf['avg_macro_mae']}")
-        log.info(f"[diagnostic] walk-forward LAST fold macro-MAE: {wf['last_fold_macro_mae']}")
-        log.info("[diagnostic] (last-fold MAE is the closest stationarity-aware proxy for Kaggle.)")
-
-    elapsed = time.time() - t0
-    log.info("=" * 70)
-    log.info(f"Training complete in {elapsed / 60:.2f} min.")
-    log.info(f"Models saved to {MODELS_DIR}/  |  log: {current_log_path()}")
-    log.info("=" * 70)
+    log.info(f"[done] total time = {(time.time() - t0) / 60:.2f} min")
 
 
 if __name__ == "__main__":

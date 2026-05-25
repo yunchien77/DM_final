@@ -1,21 +1,15 @@
-"""Training entry point for the PatchTST track — daily-resolution refactor.
+"""Training entry point for the RevIN-equipped PatchTST.
 
-Single-GPU:
-    /mnt/1stHDD/juiyun/miniforge3/envs/DMFP/bin/python -m patchtst.train_pt
+Mirrors train_pt.py exactly except:
+  - Uses `build_revin_model_from_config` instead of the base PatchTST
+  - DailyWindowDataset is configured with `apply_global_norm=False`
+    (RevIN does its own in-model per-instance normalization)
+  - Artifacts land at *_revin.pt, *_revin.npz, metrics_revin.json — does not
+    overwrite the existing patchtst_v2 checkpoint
 
-4-GPU via torchrun:
-    torchrun --standalone --nproc_per_node=4 -m patchtst.train_pt
-
-Stages:
-  0. (optional) load preprocessing artifacts if USE_PREPROCESSING is on
-  1. load daily CSVs (no aggregation) and apply preprocessing pipeline
-  2. build per-region daily arrays + enumerate anchor days + score-lag side
-     inputs (with Phase 1b staleness shift) + targets
-  3. calendar-matched train/val split on woy ± slack of each region's
-     test_end_woy, restricted to the last training year
-  4. fit per-channel mean/std on training rows only
-  5. train PatchTSTRegressor with L1 loss + severity weights + AdamW + cosine LR
-  6. evaluate per-horizon + last-anchor + per-cluster val MAE
+Usage:
+    /mnt/1stHDD/juiyun/miniforge3/envs/DMFP/bin/python -m patchtst.train_pt_revin
+    torchrun --standalone --nproc_per_node=4 -m patchtst.train_pt_revin
 """
 from __future__ import annotations
 
@@ -36,15 +30,12 @@ from torch.utils.data import DataLoader, Dataset as _Dataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).parent.parent))   # `import config`, `import validate`
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import (
     USE_PREPROCESSING, TRAIN_PATH, TEST_PATH, METEO_FEATURES, MODELS_DIR,
+    USE_REGION_CLUSTER_FEATURES,
 )
-# Phase 7 refactor removed USE_REGION_CLUSTER_FEATURES from config.py. The
-# cluster sanity-logging block here is gated on the cluster CSV existing
-# on disk, which is the actual behavior we want anyway.
-USE_REGION_CLUSTER_FEATURES = True
 from validate import compute_test_anchor_woy_per_region
 
 from patchtst.config_pt import (
@@ -52,7 +43,7 @@ from patchtst.config_pt import (
     LR, WEIGHT_DECAY, EPOCHS, WARMUP_EPOCHS, GRAD_CLIP,
     EARLY_STOP_PATIENCE, SEED,
     MAJORITY_KEEP_FRAC,
-    PT_MODEL_PATH, PT_METRICS_PATH, PT_TRAIN_PKL, PT_LOGS_DIR,
+    PT_MODELS_DIR, PT_LOGS_DIR, PT_TRAIN_PKL,
     USE_CALENDAR_MATCHED_VAL,
     CALENDAR_SLACK_WEEKS, CALENDAR_LAST_YEAR_ONLY,
 )
@@ -67,7 +58,11 @@ from patchtst.dataset_pt import (
     save_region_map,
     split_train_val_anchors,
 )
-from patchtst.model_pt import build_model_from_config
+from patchtst.revin import build_revin_model_from_config
+
+# RevIN-specific artifact paths (kept separate from the existing patchtst_v2)
+PT_REVIN_MODEL_PATH = PT_MODELS_DIR / "patchtst_revin.pt"
+PT_REVIN_METRICS_PATH = PT_MODELS_DIR / "metrics_revin.json"
 
 
 # ---------------------------------------------------------------------------
@@ -113,7 +108,6 @@ def macro_mae_per_horizon(preds: np.ndarray, truth: np.ndarray) -> tuple[float, 
 
 @torch.no_grad()
 def evaluate(model, loader, device, progress_file=None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (preds, truth, region_idxs) stacked across the val loader."""
     model.eval()
     preds, truths, r_idxs = [], [], []
     for batch in tqdm(loader, desc="val", leave=False, file=progress_file,
@@ -135,10 +129,6 @@ def evaluate(model, loader, device, progress_file=None) -> tuple[np.ndarray, np.
 # ---------------------------------------------------------------------------
 
 def _load_daily(path, is_train: bool, preproc_artifacts) -> pd.DataFrame:
-    """Read daily CSV and (optionally) apply the LGBM preprocessing pipeline.
-
-    Reuses preprocessing.apply_pipeline (impute → winsorize → log/sqrt →
-    rank-norm) for parity with the LGBM track."""
     dtype = {"region_id": str, "date": str}
     for f in METEO_FEATURES:
         dtype[f] = np.float32
@@ -158,18 +148,13 @@ def _load_daily(path, is_train: bool, preproc_artifacts) -> pd.DataFrame:
     return df
 
 
-# ---------------------------------------------------------------------------
-# Anchor subsampling (training only)
-# ---------------------------------------------------------------------------
-
 def _subsample_majority(
-    anchors: np.ndarray,         # (N, 2)
-    targets_flat: np.ndarray,    # (N, HORIZONS)
-    weights_flat: np.ndarray,    # (N,)
+    anchors: np.ndarray,
+    targets_flat: np.ndarray,
+    weights_flat: np.ndarray,
     keep_frac: float,
     seed: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Drop a fraction of training anchors whose targets are all-zero."""
     if keep_frac >= 1.0:
         return anchors, targets_flat, weights_flat
     all_zero = (targets_flat == 0).all(axis=1)
@@ -196,20 +181,18 @@ def main():
         if is_main:
             print(*args, **kwargs, flush=True)
 
-    # Route tqdm progress bars to a separate file so the main training log
-    # only carries milestone messages (stage prints, per-epoch metrics).
-    # Non-main ranks send tqdm to /dev/null since they don't have a logger.
     if is_main:
         _ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        progress_log_path = PT_LOGS_DIR / f"progress_{_ts}.log"
+        progress_log_path = PT_LOGS_DIR / f"progress_revin_{_ts}.log"
         progress_file = open(progress_log_path, "w")
         log(f"  [progress] tqdm bar -> {progress_log_path}")
     else:
         progress_file = open(os.devnull, "w")
 
     log(f"Device: {device}  rank={rank}/{world_size}  distributed={distributed}")
+    log(f"[REVIN] training the RevIN-equipped variant (variant D: μ,σ as side input)")
 
-    # -- Stage 0: preprocessing artifacts --------------------------------
+    # -- Stage 0: preprocessing artifacts -------------------------------
     preproc_artifacts = None
     if USE_PREPROCESSING:
         from preprocessing import load_preprocessing_artifacts
@@ -219,22 +202,25 @@ def main():
         except FileNotFoundError:
             log("[Stage 0] No preprocessing artifacts found — running raw daily input.")
 
-    # -- Stage 1: load daily train CSV (rank 0 only, then broadcast) ----
+    # -- Stage 1: load daily train CSV (reuse cached pickle if present) ---
     t0 = time.time()
     if is_main:
-        log("[Stage 1] loading daily train.csv (rank 0)")
-        train_daily = _load_daily(TRAIN_PATH, is_train=True,
-                                  preproc_artifacts=preproc_artifacts)
-        train_daily.to_pickle(PT_TRAIN_PKL)
-        log(f"  daily train: {train_daily.shape}  cached -> {PT_TRAIN_PKL}  "
-            f"({time.time() - t0:.1f}s)")
+        if PT_TRAIN_PKL.is_file():
+            log(f"[Stage 1] reusing cached daily train -> {PT_TRAIN_PKL}")
+            train_daily = pd.read_pickle(PT_TRAIN_PKL)
+        else:
+            log("[Stage 1] loading daily train.csv (rank 0)")
+            train_daily = _load_daily(TRAIN_PATH, is_train=True,
+                                      preproc_artifacts=preproc_artifacts)
+            train_daily.to_pickle(PT_TRAIN_PKL)
+        log(f"  daily train: {train_daily.shape}  ({time.time() - t0:.1f}s)")
     if distributed:
         dist.barrier()
     if not is_main:
         train_daily = pd.read_pickle(PT_TRAIN_PKL)
     log(f"  daily train: {train_daily.shape}")
 
-    # -- Stage 2: per-region daily arrays + anchors + side inputs -------
+    # -- Stage 2: per-region daily arrays + anchors ----------------------
     log("[Stage 2] building per-region daily arrays + anchor metadata")
     region_ids, daily_feats, daily_doys, weekly_scores = build_region_daily_arrays(
         train_daily, is_train=True,
@@ -251,9 +237,6 @@ def main():
     score_lag_inputs = compute_score_lag_side_inputs_train(weekly_scores)
     targets = compute_anchor_targets(weekly_scores)
 
-    # Drop anchors with NaN targets (final HORIZONS weeks of each region)
-    # Mask is applied during anchor split below.
-
     # -- Stage 3: calendar-matched train/val split ----------------------
     log("[Stage 3] calendar-matched train/val split")
     test_woy_per_region = compute_test_anchor_woy_per_region(TEST_PATH)
@@ -264,11 +247,10 @@ def main():
     log(f"  train anchors: {len(train_anchors):,}  "
         f"val anchors: {len(val_anchors):,}")
 
-    # Phase 13: anchors are now week indices (not day indices). w_idx = d_idx.
     def _is_valid(anchors):
         valid_mask = np.zeros(len(anchors), dtype=bool)
         for i, (r_idx, d_idx) in enumerate(anchors):
-            w_idx = int(d_idx)
+            w_idx = int(d_idx) // 7
             t = targets[int(r_idx)][w_idx]
             valid_mask[i] = not np.isnan(t).any()
         return valid_mask
@@ -280,14 +262,13 @@ def main():
     log(f"  after NaN-target filter: train={len(train_anchors):,}  val={len(val_anchors):,}")
 
     train_targets_flat = np.stack([
-        targets[int(r)][int(d)] for r, d in train_anchors
+        targets[int(r)][int(d) // 7] for r, d in train_anchors
     ]).astype(np.float32)
     train_weights_flat = severity_sample_weights(train_targets_flat)
     log(f"  severity weights: mean={train_weights_flat.mean():.3f} "
         f"max={train_weights_flat.max():.1f}  pct>=2: "
         f"{(train_weights_flat>=2).mean()*100:.1f}%")
 
-    # Majority-class subsample
     train_anchors, train_targets_flat, train_weights_flat = _subsample_majority(
         train_anchors, train_targets_flat, train_weights_flat,
         keep_frac=MAJORITY_KEEP_FRAC, seed=SEED,
@@ -295,9 +276,11 @@ def main():
     log(f"  after majority subsample (keep_frac={MAJORITY_KEEP_FRAC}): "
         f"train={len(train_anchors):,}")
 
-    # -- Stage 4: channel normalization (training-fold daily values) ----
-    log("[Stage 4] fitting per-channel normalization on training-fold days")
-    # Per region, the last training day = max(train_anchor_day_idx)
+    # -- Stage 4: channel norm — fit but DO NOT apply to the dataset ----
+    # The RevIN model does its own per-instance normalization. We still fit
+    # and save the global stats so the existing predict_pt.py path keeps
+    # working for the non-RevIN variant.
+    log("[Stage 4] fitting per-channel norm (saved but not applied; RevIN normalizes in-model)")
     train_last_day_per_region = [0] * len(region_ids)
     for r_idx, d_idx in train_anchors:
         if int(d_idx) > train_last_day_per_region[int(r_idx)]:
@@ -305,19 +288,20 @@ def main():
     mean, std = fit_channel_norm(daily_feats, train_last_day_per_region)
     if is_main:
         save_channel_norm(mean, std)
-    log(f"  mean[0]={mean[0]:.3f}  std[0]={std[0]:.3f}")
+    log(f"  (unused for RevIN) mean[0]={mean[0]:.3f}  std[0]={std[0]:.3f}")
 
-    # -- Datasets + loaders ---------------------------------------------
+    # -- Datasets (apply_global_norm=False for RevIN) -------------------
     train_ds = DailyWindowDataset(
         daily_feats, daily_doys, score_lag_inputs, targets,
         train_anchors, mean, std,
+        apply_global_norm=False,
     )
     val_ds = DailyWindowDataset(
         daily_feats, daily_doys, score_lag_inputs, targets,
         val_anchors, mean, std,
+        apply_global_norm=False,
     )
 
-    # Carry the anchor index for per-row weight lookup at loss time
     class WithIndex(_Dataset):
         def __init__(self, base):
             self.base = base
@@ -353,10 +337,10 @@ def main():
         persistent_workers=NUM_WORKERS_LOADER > 0,
     ) if is_main else None
 
-    # -- Stage 5: model + optimizer -------------------------------------
-    base_model = build_model_from_config(n_regions=len(region_ids)).to(device)
+    # -- Stage 5: RevIN model + optimizer -------------------------------
+    base_model = build_revin_model_from_config(n_regions=len(region_ids)).to(device)
     n_params = sum(p.numel() for p in base_model.parameters())
-    log(f"[Stage 5] PatchTSTRegressor params={n_params/1e6:.2f}M  "
+    log(f"[Stage 5] RevINPatchTSTRegressor params={n_params/1e6:.2f}M  "
         f"(global batch={BATCH_SIZE * world_size})")
     model = DDP(base_model, device_ids=[local_rank]) if distributed else base_model
 
@@ -371,7 +355,6 @@ def main():
     patience = 0
     history: list[dict] = []
 
-    # For cluster-stratified val MAE
     cluster_csv = MODELS_DIR / "region_clusters.csv"
     cluster_table = (
         pd.read_csv(cluster_csv, dtype={"region_id": str})
@@ -379,7 +362,6 @@ def main():
     )
     region_idx_to_cluster = None
     if cluster_table is not None:
-        # Map region_idx -> cluster_id (use the same order as region_ids)
         cluster_lookup = dict(zip(cluster_table["region_id"].astype(str),
                                   cluster_table["region_cluster_id"].astype(int)))
         region_idx_to_cluster = np.array(
@@ -432,11 +414,10 @@ def main():
                 f"val_macro_MAE={macro:.4f}  "
                 f"per_h=[{', '.join(f'{p:.3f}' for p in per)}]")
 
-            # Per-cluster MAE report (only if cluster table available)
             cluster_report = None
             if region_idx_to_cluster is not None:
                 cluster_ids = region_idx_to_cluster[r_idxs]
-                abs_err = np.abs(preds_arr - truth_arr).mean(axis=1)  # (n_val,)
+                abs_err = np.abs(preds_arr - truth_arr).mean(axis=1)
                 cluster_macro = {}
                 for cid in sorted(np.unique(cluster_ids)):
                     mask = cluster_ids == cid
@@ -463,8 +444,8 @@ def main():
                     "epoch": epoch + 1,
                     "val_macro_mae": macro,
                     "val_per_horizon": per,
-                }, PT_MODEL_PATH)
-                log(f"    new best -> saved to {PT_MODEL_PATH}")
+                }, PT_REVIN_MODEL_PATH)
+                log(f"    new best -> saved to {PT_REVIN_MODEL_PATH}")
                 stop_signal = 0
             else:
                 patience += 1
@@ -482,14 +463,14 @@ def main():
 
     log(f"\nBest val macro MAE: {best_macro:.4f}  (epoch {best_epoch})")
     if is_main:
-        with open(PT_METRICS_PATH, "w") as f:
+        with open(PT_REVIN_METRICS_PATH, "w") as f:
             json.dump({
                 "best_val_macro_mae": best_macro,
                 "best_epoch": best_epoch,
                 "world_size": world_size,
                 "history": history,
             }, f, indent=2)
-        log(f"Wrote metrics -> {PT_METRICS_PATH}")
+        log(f"Wrote metrics -> {PT_REVIN_METRICS_PATH}")
 
     if distributed:
         dist.barrier()

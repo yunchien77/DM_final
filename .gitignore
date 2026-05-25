@@ -7,3 +7,6 @@ PIPELINE.md
 .claude/*
 code/patchtst/models_pt/*
 **/__pycache__/**
+*.zip
+Drought*
+code/patchtst/logs_pt*

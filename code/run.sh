@@ -40,10 +40,14 @@ cd "$(dirname "$SCRIPT_PATH")"   # -> code/
 TS=$(date +%Y%m%d_%H%M%S)
 mkdir -p logs
 TRAIN_LOG=logs/train_${TS}.log
+ANALYSIS_LOG=logs/analysis_${TS}.log
 PRED_LOG=logs/predict_${TS}.log
 
 echo "==> training (single process)  log=$TRAIN_LOG"
 $PY -m train 2>&1 | tee "$TRAIN_LOG"
+
+echo "==> analysis  log=$ANALYSIS_LOG"
+$PY -m analysis 2>&1 | tee "$ANALYSIS_LOG"
 
 echo "==> predicting  log=$PRED_LOG  output=${OUTPUT_PATH:-<default>}"
 if [ -n "$OUTPUT_PATH" ]; then
@@ -53,3 +57,4 @@ else
 fi
 
 echo "==> done. submission at ${OUTPUT_PATH:-$(pwd)/../submission.csv}"
+echo "==> feature analysis at $(pwd)/diagnostics/feature_analysis.md"
