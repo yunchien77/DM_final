@@ -34,8 +34,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import (
     USE_PREPROCESSING, TRAIN_PATH, TEST_PATH, METEO_FEATURES, MODELS_DIR,
-    USE_REGION_CLUSTER_FEATURES,
 )
+try:
+    from config import USE_REGION_CLUSTER_FEATURES
+except ImportError:
+    USE_REGION_CLUSTER_FEATURES = False   # optional per-cluster val logging only
 from validate import compute_test_anchor_woy_per_region
 
 from patchtst.config_pt import (
@@ -250,7 +253,7 @@ def main():
     def _is_valid(anchors):
         valid_mask = np.zeros(len(anchors), dtype=bool)
         for i, (r_idx, d_idx) in enumerate(anchors):
-            w_idx = int(d_idx) // 7
+            w_idx = int(d_idx)   # Phase-13 anchors are ALREADY week indices (was //7 bug)
             t = targets[int(r_idx)][w_idx]
             valid_mask[i] = not np.isnan(t).any()
         return valid_mask
@@ -262,7 +265,7 @@ def main():
     log(f"  after NaN-target filter: train={len(train_anchors):,}  val={len(val_anchors):,}")
 
     train_targets_flat = np.stack([
-        targets[int(r)][int(d) // 7] for r, d in train_anchors
+        targets[int(r)][int(d)] for r, d in train_anchors   # week index (was //7 bug)
     ]).astype(np.float32)
     train_weights_flat = severity_sample_weights(train_targets_flat)
     log(f"  severity weights: mean={train_weights_flat.mean():.3f} "

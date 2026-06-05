@@ -36,7 +36,7 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import RidgeCV
 
-from config import MODELS_DIR
+from config import MODELS_DIR, PROXY_SAMPLES_PER_REGION
 from features_climate import CLIMATE_FEATURE_COLS
 from features_windowed import windowed_feature_cols
 from features_score import CALENDAR_FEATURE_COLS
@@ -62,11 +62,32 @@ def meteo_feature_cols() -> list[str]:
     return [c for c in cols if not (c in seen or seen.add(c))]
 
 
+def _sample_recent_per_region(
+    train_features: pd.DataFrame,
+    samples_per_region: int,
+) -> pd.DataFrame:
+    """Phase 11: cap proxy ridge to the N most-recent valid score rows per
+    region. Reduces training-set size from ~1.5M → ~90k and biases the fit
+    toward recent climate, which matches test conditions better than fitting
+    on the entire training history (which mixes decades of climate regimes).
+    """
+    if samples_per_region <= 0 or "week_idx" not in train_features.columns:
+        return train_features
+    # Within each region, take the N rows with the largest week_idx.
+    return (
+        train_features.sort_values(["region_id", "week_idx"])
+        .groupby("region_id", sort=False, group_keys=False)
+        .tail(samples_per_region)
+        .reset_index(drop=True)
+    )
+
+
 def fit_proxy_ridge(
     train_features: pd.DataFrame,
     target_col: str = "target_w1",
     feature_cols: list[str] | None = None,
     output_path: Path = PROXY_RIDGE_PATH,
+    samples_per_region: int | None = None,
 ) -> tuple[RidgeCV, list[str], float]:
     """Fit a Ridge regressor on meteo features → drought score.
 
@@ -76,18 +97,26 @@ def fit_proxy_ridge(
     the model never sees its own row's score in inference). target_w1 is the
     closest target the proxy can learn against without leakage.
 
+    `samples_per_region` (Phase 11): if set, only fit on the N most-recent
+    valid score rows per region. Defaults to `PROXY_SAMPLES_PER_REGION` from
+    config (0 disables the cap, preserving Phase 10 behavior).
+
     Returns (model, used_feature_cols, train_spearman).
     """
     if feature_cols is None:
         feature_cols = meteo_feature_cols()
+    if samples_per_region is None:
+        samples_per_region = PROXY_SAMPLES_PER_REGION
+
+    fit_df = _sample_recent_per_region(train_features, samples_per_region)
 
     # Subset to columns actually present in train_features (in case some
     # feature block was disabled).
-    cols = [c for c in feature_cols if c in train_features.columns]
+    cols = [c for c in feature_cols if c in fit_df.columns]
     if not cols:
         raise RuntimeError("No meteo features available for the proxy Ridge.")
-    X = train_features[cols].to_numpy(np.float32)
-    y = train_features[target_col].to_numpy(np.float32)
+    X = fit_df[cols].to_numpy(np.float32)
+    y = fit_df[target_col].to_numpy(np.float32)
 
     # Replace NaN / Inf in X with column-mean (impute, don't drop). Dropping
     # was empirically too aggressive — a single buggy feature column would
@@ -102,10 +131,8 @@ def fit_proxy_ridge(
     if not mask_y.all():
         X, y = X[mask_y], y[mask_y]
 
-    # RidgeCV defaults to LOOCV; for ~1.6M rows we want a cheaper, k-fold CV.
-    # sklearn RidgeCV with cv=5 does k-fold without group-awareness; that's
-    # acceptable for the proxy (we're not estimating generalization here, we're
-    # tuning α to avoid overfitting in-sample).
+    # RidgeCV with cv=5 (k-fold without group-awareness). With the per-region
+    # sampling cap the fit set is ~90k rows so this is fast.
     model = RidgeCV(alphas=_ALPHA_GRID, cv=5)
     model.fit(X, y)
 

@@ -2,23 +2,15 @@
 
 The minimal set we keep alongside the climate / windowed-stats features:
 
-  - score_lag1            : single-step Markov anchor. Gain ≈ 0.17 in Phase 1b v2
-                            and dropping it cost 0.037 Kaggle in Step 9.
-                            Computed with the test-style staleness shift: the
-                            anchor at week_idx W uses scores[W − 1 − SHIFT], i.e.
-                            (TEST_WEEKS_PER_REGION − 1) weeks back, matching
-                            the information distance test rows have.
+  - score_lag1            : single-step Markov anchor (12-week shift). Currently
+                            disabled at the feature level (USE_SCORE_LAG=False)
+                            — the train↔test gap of ~163 weeks makes any short
+                            shift a phantom anchor. Column still computed for
+                            transition-weight code that references it.
   - region history        : region_score_mean / _std / _zero_rate / _max,
                             computed from training-fold rows only.
   - calendar              : month/doy sin/cos.
-  - score climatology     : per (region, woy) mean/std/max/p90/zero_rate of
-                            historical scores. The model can use this for both
-                            (region_woy_score_mean) at the ANCHOR woy and at
-                            the TARGET woy (via the `target_woy` per horizon).
-
-We do NOT keep score_lag2/4/8/52, weeks_since_last_nonzero, max_score_prev8 —
-their incremental gain on top of score_lag1 was small and they correlate with
-each other.
+  - score climatology     : per (region, woy) mean/std/max/p90/zero_rate.
 """
 
 from __future__ import annotations
@@ -28,10 +20,8 @@ import pandas as pd
 
 from config import MODELS_DIR, TEST_WEEKS_PER_REGION
 
-# Test rows predict 5 weeks ahead after a 13-week unscored block. So the lag
-# source at test time is (13 − 1) = 12 weeks back from the anchor. We apply
-# the same shift to training so the (lag-source → first-target) distance
-# matches across train/test.
+# Test rows predict 5 weeks ahead after a 13-week unscored block. The legacy
+# shift matches test's unscored window only (not the full train↔test gap).
 SCORE_LAG_SHIFT = TEST_WEEKS_PER_REGION - 1   # 12
 
 REGION_STATS_PATH = MODELS_DIR / "region_stats.csv"

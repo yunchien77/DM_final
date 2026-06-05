@@ -24,7 +24,7 @@ from config import (
 )
 from patchtst.config_pt import (
     LOOKBACK_DAYS, HORIZONS, BATCH_SIZE, NUM_WORKERS_LOADER,
-    PT_LOGS_DIR,
+    PT_LOGS_DIR, PT_TRAIN_PKL,
 )
 from patchtst.dataset_pt import (
     build_region_daily_arrays,
@@ -129,10 +129,30 @@ def main(output_path: Path | str | None = None):
     test_daily = _load_test_daily(preproc_artifacts)
     print(f"  daily test: {test_daily.shape}  ({time.time()-t0:.1f}s)")
 
-    region_ids, daily_feats, daily_doys, _ = build_region_daily_arrays(
+    # Phase 13 / RevIN fix: the model needs 260 WEEKS of per-region history, but the
+    # test window is only 13 weeks. Concatenate each region's TRAIN weekly history
+    # (cached PT_TRAIN_PKL) + test weekly, then take the last LOOKBACK_DAYS weeks
+    # (done in TestDailyDatasetRaw via mat[-LOOKBACK_DAYS:]). Mirrors predict_pt.py.
+    print(f"[Stage 1b] loading cached train daily from {PT_TRAIN_PKL}")
+    train_daily = pd.read_pickle(PT_TRAIN_PKL)
+    train_region_ids, train_weekly_feats, _, _ = build_region_daily_arrays(
+        train_daily, is_train=False,
+    )
+    train_weekly_map = dict(zip(train_region_ids, train_weekly_feats))
+    del train_daily
+
+    test_region_ids, test_weekly_feats, test_weekly_doys, _ = build_region_daily_arrays(
         test_daily, is_train=False,
     )
-    print(f"[Stage 2] regions={len(region_ids)}  days/region={daily_feats[0].shape[0]}")
+    region_ids, daily_feats, daily_doys = [], [], []
+    for rid, t_feats, t_doys in zip(test_region_ids, test_weekly_feats, test_weekly_doys):
+        feats = (np.vstack([train_weekly_map[rid], t_feats])
+                 if rid in train_weekly_map else t_feats)
+        region_ids.append(rid)
+        daily_feats.append(feats)
+        daily_doys.append(t_doys)   # anchor week's doy is t_doys[-1]
+    print(f"[Stage 2] regions={len(region_ids)}  "
+          f"concat weekly rows/region={daily_feats[0].shape[0]} (lookback needs {LOOKBACK_DAYS})")
 
     region_map = load_region_map()
     region_emb_idx = np.asarray(

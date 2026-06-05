@@ -1,12 +1,42 @@
-code/diagnostics/*
-code/logs/*
-dataset/*
+# === Logs ===
+**/logs/
+**/logs_pt/
+*.log
+
+# === Models / trained artifacts ===
+**/models/
+**/models_pt/
+**/artifacts/
+*.pt
+*.pkl
+*.cbm
+*.npz
+*.bin
+
+# === Caches ===
+**/cache/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# === Data / datasets ===
+**/dataset/
+**/data/
+Drought-Prediction-main/
+Drought*/
+
+# === Outputs / scratch ===
+**/diagnostics/
+**/scratch/
+**/reports/
+**/eval/
 submission*
-code/models/*
-PIPELINE.md
-.claude/*
-code/patchtst/models_pt/*
-**/__pycache__/**
+
+# === Archives ===
 *.zip
-Drought*
-code/patchtst/logs_pt*
+
+# === Misc ===
+.claude/
+PIPELINE.md
+.DS_Store
+.ipynb_checkpoints/

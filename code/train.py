@@ -78,7 +78,8 @@ from zero_inflated import (
 )
 from validate import (
     fixed_holdout_split, calendar_matched_split,
-    compute_test_anchor_woy_per_region, evaluate_predictions, print_validation_report,
+    compute_test_anchor_woy_per_region, compute_region_test_months,
+    evaluate_predictions, print_validation_report,
 )
 
 
@@ -395,9 +396,17 @@ def main():
             f"min={float(sample_weight.min()):.3f}  max={float(sample_weight.max()):.3f}"
         )
 
-    # Stage 5 — Phase 10 walk-forward CV (or legacy single-split training).
+    # Stage 5 — walk-forward CV (or legacy single-split training).
     X_combined = combined_split[feature_cols]
     time_keys = combined_split["week_idx"].to_numpy(np.int32)
+    # Per-row helpers for Phase 11 Kaggle-proxy ES + calendar-matched ES
+    region_ids_arr = combined_split["region_id"].astype(str).to_numpy()
+    months_arr = combined_split["month"].to_numpy(np.int32)
+    from config import USE_KAGGLE_PROXY_VAL, USE_CAL_MATCHED_ES
+    region_test_months = compute_region_test_months(TEST_PATH)
+    log.info(f"  region_test_months: {len(region_test_months)} regions  "
+             f"USE_KAGGLE_PROXY_VAL={USE_KAGGLE_PROXY_VAL}  "
+             f"USE_CAL_MATCHED_ES={USE_CAL_MATCHED_ES}")
 
     if USE_ZERO_INFLATED:
         # Legacy two-stage path; not used by Phase 10 default config.
@@ -438,6 +447,11 @@ def main():
                 X_combined, y_h, time_keys,
                 horizon=h, sample_weight=sample_weight,
                 n_folds=N_WF_FOLDS, purge_weeks=WF_PURGE_WEEKS,
+                region_ids=region_ids_arr,
+                months=months_arr,
+                region_test_months=region_test_months,
+                use_kaggle_proxy_val=USE_KAGGLE_PROXY_VAL,
+                use_cal_matched_es=USE_CAL_MATCHED_ES,
             )
             fold_models_by_horizon[h] = fold_models
             oof[:, i] = oof_h

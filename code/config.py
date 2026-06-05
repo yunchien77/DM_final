@@ -82,6 +82,8 @@ RANK_NORMALIZE_FEATURES = ["humidity", "wb_tmp", "tmp_range"]
 # weeks; score autocorrelation 0.96^163 ≈ 0.001. The lag is predictive on val
 # (where the shifted gap is ~14 weeks) but useless on test — a phantom anchor.
 # Replaced by Block 1b (proxy score) which has identical train/test semantics.
+# Phase 11 considered re-enabling with teammate's per-region gap shift but
+# deferred — measured benefit on user's data unclear, focus on independent wins.
 USE_SCORE_LAG = False
 
 # Block 1b — Phase 8 proxy score. Ridge regression mapping meteo features
@@ -118,22 +120,20 @@ TRANSITION_SMOOTHING_BETA = 0.8     # tuned on val ∈ {0.6, 0.7, 0.8, 0.9}
 TRANSITION_CLUSTERS = 1             # single global matrix; raise to use per-cluster matrices
 TRANSITION_SMOOTHING_ALPHA = 1.0    # Laplace smoothing for transition counts
 
-# Training-time transition weights (Step C3). Phase 7 v2: enabled to upweight
-# rare 1-step score transitions (heavy-tail moves the L1 model under-fits).
-# Weight = 1 + γ · (1 − P_c^1[score_lag1, observed_score]). γ=1.0 caps the
-# maximum weight at 2× uniform.
-# Note: needs `score_lag1` as the "previous score" reference. Phase 8 keeps
-# the score_lag1 column computed internally but excludes it from feature_cols
-# (it's the phantom-anchor problem; useful here only as a weighting input).
-USE_TRANSITION_WEIGHT = True
+# Training-time transition weights (Step C3). Phase 11: DISABLED. Stacking
+# transition × severity weights amplified the L1-median bias in Phase 10
+# (Kaggle 0.8975 with pred mean +0.42 vs baseline). With the lag-shift
+# features re-enabled, the anchor pull comes from features instead of weights.
+USE_TRANSITION_WEIGHT = False
 TRANSITION_WEIGHT_GAMMA = 1.0
 
-# Phase 8 — severity weighting RESTORED at the teammate's settings.
-# Per-row weight = 1 + α · 𝟙[y > 0] + β · 𝟙[y ≥ 3], where y = target_w1.
-# Multiplied on top of the transition weight before normalization. The
-# teammate uses α=0.5 (mild any-nonzero boost) and β=3 (strong severe
-# boost) and gets 0.82 Kaggle.
-USE_SEVERITY_WEIGHT = True
+# Phase 12 ablation: severity weights DISABLED to test the bias hypothesis.
+# Phase 10 (with severity α=0.5 β=3) → Kaggle 0.8975, pred mean 1.23 (+0.42 bias).
+# Phase 11 (same severity weights, smaller model) → Kaggle 0.9111, pred mean 1.29 (+0.49).
+# Teammate uses identical weights and gets +0.18 bias → 0.8255. The bias
+# amplification appears specific to user's woy-standardized climate features.
+# This ablation tests whether dropping the weights pulls pred mean back to truth.
+USE_SEVERITY_WEIGHT = False
 SAMPLE_WEIGHT_ALPHA = 0.5
 SAMPLE_WEIGHT_BETA = 3.0
 
@@ -171,27 +171,27 @@ LEAN_FEATURE_LIST_PATH = MODELS_DIR / "feature_cols_lean.json"
 # ---------------------------------------------------------------------------
 
 LGBM_PARAMS = dict(
-    # Phase 10: L1 (MAE-aligned), matching teammate's 0.8255 Kaggle baseline and
-    # the user's own val finding (L1 beats two-stage 0.4522 vs 0.5212, see
-    # [[feedback_dmfp_loss_choice]]). MAE-as-metric was already in place; only
-    # the objective changes. Tweedie + zero-inflated were Phase 9 experiments
-    # that both regressed Kaggle relative to the L1 single-stage baseline.
+    # Phase 11: rolled back from Phase 10's teammate-style 255-leaf / lr=0.015
+    # / 5000-iter setup (regressed to Kaggle 0.8975, +0.42 pred mean bias)
+    # toward your previously known-good values. L1 objective retained
+    # ([[feedback_dmfp_loss_choice]]). Smaller model + lag-shift features
+    # should pull pred mean back toward truth.
     objective="regression_l1",
     metric="mae",
-    n_estimators=5000,
-    learning_rate=0.015,
-    num_leaves=255,
-    min_child_samples=20,
+    n_estimators=3000,
+    learning_rate=0.02,
+    num_leaves=63,
+    min_child_samples=50,
     feature_fraction=0.7,
     bagging_fraction=0.8,
-    bagging_freq=5,
-    reg_alpha=0.05,
-    reg_lambda=0.05,
+    bagging_freq=1,
+    reg_alpha=0.1,
+    reg_lambda=0.1,
     n_jobs=-1,
     random_state=42,
     verbose=-1,
 )
-EARLY_STOPPING_ROUNDS = 150
+EARLY_STOPPING_ROUNDS = 100
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +204,31 @@ EARLY_STOPPING_ROUNDS = 150
 USE_WALK_FORWARD_CV = True
 N_WF_FOLDS = 4              # walk-forward folds per horizon (matches teammate's N_PH_FOLDS)
 WF_PURGE_WEEKS = 13         # 91-day purge gap, expressed in weeks (user data is weekly)
-USE_ISOTONIC_CALIBRATION = True
+USE_ISOTONIC_CALIBRATION = True  # auto-rejected if post-cal MAE > pre-cal MAE
+
+
+# ---------------------------------------------------------------------------
+# Kaggle proxy val + calendar-matched ES (Phase 11 — Path 2 merge)
+# ---------------------------------------------------------------------------
+
+# Per region, hold out the most recent in-season anchor as a fixed ES set
+# used by EVERY fold. Mirrors Kaggle's "predict 5 weeks after the test window
+# end" structure so ES stops where test-season performance peaks instead of
+# where global-CV performance peaks.
+USE_KAGGLE_PROXY_VAL = True
+KAGGLE_PROXY_BANDWIDTH = 2     # ± months around region's test month qualify as in-season
+
+# Within each fold's CV val, filter to samples within ± bandwidth months of
+# the region's test month before using as ES set. Falls back to full val if
+# too few in-season samples remain.
+USE_CAL_MATCHED_ES = True
+CAL_MATCHED_ES_BANDWIDTH = 2
+CAL_MATCHED_ES_MIN_SAMPLES = 20
+
+# Cap proxy ridge sampling to the N most-recent valid score rows per region.
+# Teammate uses 40 → fits on ~90k samples, much less prone to old-climate
+# contamination than user's 1.5M-row RidgeCV fit.
+PROXY_SAMPLES_PER_REGION = 40
 
 
 # ---------------------------------------------------------------------------

@@ -47,6 +47,70 @@ def compute_test_anchor_woy_per_region(test_path: str | Path) -> dict[str, int]:
     return dict(zip(last.index, woys.tolist()))
 
 
+def compute_region_test_months(test_path: str | Path) -> dict[str, int]:
+    """Return {region_id: month_of_first_test_date}. Used by the Kaggle-proxy
+    val holdout (Phase 11) — each region's "test season" is anchored to the
+    month its 13-week test window begins."""
+    test = pd.read_csv(test_path, usecols=["region_id", "date"], dtype={"region_id": str, "date": str})
+    first = test.groupby("region_id")["date"].first()
+    months = first.str.split("-", expand=True)[1].astype(int).values
+    return dict(zip(first.index, months.tolist()))
+
+
+# ---------------------------------------------------------------------------
+# Region-gap helper (Phase 11) — weeks between each region's train end and
+# test start. Used by the lag-shift feature (`USE_SCORE_LAG_SHIFT=True`) so
+# the (lag-source → target) distance at training matches the test gap.
+# ---------------------------------------------------------------------------
+
+def _ymd_to_ordinal(y: int, m: int, d: int) -> int:
+    """Gregorian ordinal that works for years > 9999 (dataset uses synthetic years)."""
+    mdays = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    is_leap = (y % 4 == 0) and (y % 100 != 0 or y % 400 == 0)
+    doy = sum(mdays[1:m]) + (1 if m > 2 and is_leap else 0) + d
+    y1 = y - 1
+    return y1 * 365 + y1 // 4 - y1 // 100 + y1 // 400 + doy
+
+
+def _parse_date_ymd(s: str) -> tuple[int, int, int]:
+    parts = str(s).strip().split("T")[0].split(" ")[0].replace("/", "-").replace(".", "-").split("-")
+    return int(parts[0]), int(parts[1]), int(parts[2])
+
+
+def compute_region_gap_dict(
+    train_path: str | Path,
+    test_path: str | Path,
+    default_gap_weeks: float = 52.0,
+) -> dict[str, float]:
+    """Per region, weeks between last train date and first test date.
+
+    Mirrors teammate's `validate_regions_and_gap`. Returns gap in weeks (float)
+    keyed by region_id (string). Regions missing from one side get
+    `default_gap_weeks`.
+    """
+    train = pd.read_csv(train_path, usecols=["region_id", "date"], dtype={"region_id": str, "date": str})
+    test = pd.read_csv(test_path, usecols=["region_id", "date"], dtype={"region_id": str, "date": str})
+
+    train_ends = train.groupby("region_id")["date"].last()
+    test_starts = test.groupby("region_id")["date"].first()
+
+    region_gap: dict[str, float] = {}
+    for r in test_starts.index:
+        if r not in train_ends.index:
+            region_gap[str(r)] = default_gap_weeks
+            continue
+        try:
+            te_y, te_m, te_d = _parse_date_ymd(train_ends[r])
+            ts_y, ts_m, ts_d = _parse_date_ymd(test_starts[r])
+            ord_te = _ymd_to_ordinal(te_y, te_m, te_d)
+            ord_ts = _ymd_to_ordinal(ts_y, ts_m, ts_d)
+            gap_days = max(0, ord_ts - ord_te)
+            region_gap[str(r)] = float(gap_days) / 7.0
+        except Exception:
+            region_gap[str(r)] = default_gap_weeks
+    return region_gap
+
+
 def _circular_woy_distance(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Wrap-around distance in [0, 26]."""
     d = np.abs(a.astype(np.int16) - b.astype(np.int16))
