@@ -1,10 +1,8 @@
-numpy>=1.26
+# Reproduction pipeline dependencies (Python 3.10).
+# A CUDA-enabled torch is recommended (DLinear trains on GPU); CPU also works.
+numpy>=2.2
 pandas>=2.2
-lightgbm>=4.3
-scikit-learn>=1.4
-statsmodels>=0.14
-matplotlib>=3.8
-seaborn>=0.13
+torch>=2.6
+lightgbm>=4.6
+scikit-learn>=1.7
 tqdm>=4.66
-ipykernel>=6.29
-jupyter>=1.0

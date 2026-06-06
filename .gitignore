@@ -40,3 +40,10 @@ submission*
 PIPELINE.md
 .DS_Store
 .ipynb_checkpoints/
+
+# === GitHub push: exclude archive, generated outputs, and ALL csv except the teammate's ===
+archive/
+reproduce/out/
+*.csv
+!reproduce/frozen/
+!reproduce/frozen/submission_teammate_082.csv
