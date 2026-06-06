@@ -48,3 +48,8 @@ reproduce/out/
 *.csv
 !reproduce/frozen/
 !reproduce/frozen/submission_teammate_082.csv
+# keep the byte-identical best-2 submissions and their base predictions
+!best_submissions/
+!best_submissions/*.csv
+!best_submissions/base_predictions/
+!best_submissions/base_predictions/*.csv

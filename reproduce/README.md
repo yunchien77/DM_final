@@ -4,7 +4,7 @@ Trains every component from scratch and blends them into the two submissions. Se
 `README.md` for the full description; quick reference:
 
 ```bash
-bash reproduce/run.sh          # quick mode (~30–40 min)
+bash reproduce/run.sh          # quick smoke test mode 
 FULL=1 bash reproduce/run.sh   # full mode (several hours)
 ```
 

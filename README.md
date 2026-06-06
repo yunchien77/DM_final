@@ -9,7 +9,28 @@ Best submission `submission_blend_ENS_354025.csv` → Kaggle public **0.7862**.
 
 ---
 
-## How to run
+## Reproduce the submission
+
+There are two ways: **Option A** regenerates the exact submitted files instantly from the model
+outputs included in the repo (no training); **Option B** retrains every component from scratch.
+
+## Option A — Byte-identical (no training, no GPU)
+
+Reproduce the two best submissions **bit-for-bit** from the base predictions shipped in the repo:
+
+```bash
+python best_submissions/make_byte_identical.py
+```
+
+This writes files identical to the originals:
+
+- `best_submissions/submission_blend_ENS_354025.csv` — Kaggle **0.7862**
+- `best_submissions/submission_blend_TDP_354025.csv` — Kaggle **0.7864**
+
+It needs no dataset, GPU, or training — it blends the frozen model outputs in
+`best_submissions/base_predictions/`. Details: [`best_submissions/README.md`](best_submissions/README.md).
+
+## Option B — Retrain every component from scratch
 
 ### Step 1 — Environment
 
@@ -107,8 +128,10 @@ Full details, formulas, and experiments are in the submitted report
 ## Repository structure (brief)
 
 ```
-dlinear/        DLinear component (training + inference)
-lgbm/           phase1b LightGBM component (trains 382 features + 5 boosters)
-reproduce/      orchestration: run.sh, train_dlinear.sh, regen_dlinear.py, blend.py, build_daily.py
-experiments/    code-only snapshots of other approaches we tried
+best_submissions/  byte-identical reproduction (Option A): base predictions + make_byte_identical.py
+dlinear/           DLinear component (training + inference)
+lgbm/              phase1b LightGBM component (trains 382 features + 5 boosters)
+reproduce/         orchestration: run.sh, train_dlinear.sh, regen_dlinear.py, blend.py, build_daily.py
+experiments/       code-only snapshots of other approaches we tried
+EDA/               exploratory data analysis (notebooks)
 ```
