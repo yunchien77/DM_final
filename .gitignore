@@ -41,8 +41,9 @@ PIPELINE.md
 .DS_Store
 .ipynb_checkpoints/
 
-# === GitHub push: exclude archive, generated outputs, and ALL csv except the teammate's ===
+# === GitHub push: exclude archive, report, generated outputs, and ALL csv except the teammate's ===
 archive/
+report/
 reproduce/out/
 *.csv
 !reproduce/frozen/
