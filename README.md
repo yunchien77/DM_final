@@ -35,7 +35,7 @@ A single command trains every component from scratch and writes the two submissi
 # Reproduce the best submission — LightGBM 8000 iterations/horizon  → Kaggle 0.7862
 FULL=1 ./reproduce.sh
 
-# Faster — LightGBM trimmed to 3000 iterations/horizon  → Kaggle 0.7904 (corr 0.998)
+# Faster — LightGBM trimmed to 3000 iterations/horizon  → Kaggle 0.7904 (corr 0.998 with the 0.7862 submission)
 FULL=1 LGBM_N_EST=3000 ./reproduce.sh
 
 # Quick smoke run — reduced training, only to confirm the pipeline executes end-to-end
@@ -46,7 +46,7 @@ FULL=1 LGBM_N_EST=3000 ./reproduce.sh
 
 The submissions are written to `reproduce/out/`:
 ```
-submission_blend_ENS_354025.csv     <- submit this (best)
+submission_blend_ENS_354025.csv     <- submit this
 submission_blend_TDP_354025.csv
 ```
 
@@ -102,7 +102,7 @@ submission = shrink × ( 0.40 · DLinear  +  0.35 · teammate_LGBM  +  0.25 · p
 - **teammate LightGBM** — gap-stratified, isotonic-calibrated GBDT (`reproduce/frozen/...`).
 - **shrink** — TDP `0.975092816675869`, ENS `0.9694903458056041`.
 
-Full details, formulas, and experiments are in [`report/`](report/).
+Full details, formulas, and experiments are in the submitted report
 
 ## Repository structure (brief)
 
@@ -111,6 +111,4 @@ dlinear/        DLinear component (training + inference)
 lgbm/           phase1b LightGBM component (trains 382 features + 5 boosters)
 reproduce/      orchestration: run.sh, train_dlinear.sh, regen_dlinear.py, blend.py, build_daily.py
 experiments/    code-only snapshots of other approaches we tried
-report/         LaTeX report
-dataset/data/   train.csv, test.csv, sample_submission.csv  (you provide)
 ```
