@@ -1,6 +1,6 @@
 # Drought Severity Prediction
 
-Predicts drought severity (score 0–5) for 1–5 weeks ahead, evaluated by MAE.
+Predicts drought severity (score 0–5) for 1–5 weeks ahead.
 
 ---
 
@@ -195,20 +195,6 @@ drought/
 
 ---
 
-## Installation
-
-```bash
-pip install lightgbm scikit-learn pandas numpy matplotlib scipy tqdm
-
-# Optional: XGBoost ensemble
-pip install xgboost>=2.0.0
-
-# Optional: PatchTST deep learning
-pip install torch>=2.0.0
-```
-
----
-
 ## Usage
 
 ### Training
@@ -245,44 +231,4 @@ python predict.py --output /path/to/result.csv
 
 # Force rebuild test features (ignore cache)
 python predict.py --force-rebuild
-```
-
----
-
-## Evaluation Metrics
-
-| Metric | Description |
-|--------|-------------|
-| **MAE** | Primary competition metric (lower is better) |
-| **RMSE** | More sensitive to large errors |
-| **R²** | Explained variance (1=perfect, 0=mean prediction only) |
-| **Bias** | Systematic over/under-prediction |
-| **P95 abs error** | 95th percentile absolute error — tail performance |
-| **MASE** | Relative to naïve baseline; <1 beats baseline |
-| **MAE by score class** | Per-severity-level breakdown |
-| **Per-region MAE** | Identifies hard-to-predict regions |
-
----
-
-## Performance Settings
-
-```python
-# code/config.py
-
-# Parallel feature engineering (default: half of CPU cores)
-N_WORKERS = max(1, os.cpu_count() // 2)
-
-# Reduce for faster debug runs
-SAMPLE_FRAC        = 0.2
-MAX_WIN_PER_REGION = 40
-
-# GPU acceleration (LightGBM)
-LGBM_DEVICE   = "gpu"
-GPU_DEVICE_ID = 0
-
-# Enable/disable model components
-USE_XGBOOST       = True
-USE_GAP_STRATIFIED = True
-USE_ZERO_INFLATED  = True
-USE_PATCHTST       = True
 ```
