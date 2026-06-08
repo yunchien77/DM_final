@@ -1,6 +1,6 @@
 # Drought Severity Prediction
 
-Predicts drought severity (score 0–5) for 1–5 weeks ahead.
+Predicts drought severity (score 0–5) for 1–5 weeks ahead. 
 
 ---
 
@@ -9,7 +9,7 @@ Predicts drought severity (score 0–5) for 1–5 weeks ahead.
 ```
 Raw daily meteorological data
     │
-    ▼ [Stage 0] Preprocessing  (winsorization → imputation → log/sqrt → rank-norm)
+    ▼ [Stage 0] Preprocessing  (winsorization → imputation → log/sqrt)
     │
     ▼ [Stage 1] Climatology    (per-region long-term mean/std, monthly baselines, score stats)
     │
@@ -17,16 +17,11 @@ Raw daily meteorological data
     │
     ▼ [Stage 3] Feature matrix (parallel, 91-day rolling window, ~430 features)
     │
-    ▼ [Stage 3.5] Adversarial Weights (reweight train to match test distribution)
+    ▼ [Stage 3.5] Adversarial Weights (disabled: train/test regions fully overlap)
     │
     ▼ [Stage 4] Model training
-    │     4a: Phase 1 LightGBM → Feature Importance
-    │     4b: Feature Pruning (drop bottom 25% by importance)
-    │     4c-1: Phase 2 LightGBM (main model, Calendar-Matched Validation)
-    │     4c-2: Gap-Stratified LightGBM (short/long gap strata)
-    │     4d: XGBoost (GPU-accelerated, 20% blend weight)
-    │     4e: Zero-Inflated two-stage model (59.6% zero optimization)
-    │     4f: PatchTST (DataParallel across 6 GPUs, 364-day window)
+    │     4a: Per-horizon LightGBM (main model, Calendar-Matched Validation)
+    │     4b: Gap-Stratified LightGBM (short/long gap strata)
     │
     ▼ [Stage 5] Isotonic Calibration + persistence
     │
@@ -81,7 +76,6 @@ Early stopping uses only validation samples whose calendar month matches the tes
 | Per-region median imputation | Fill missing values using region-specific medians |
 | Winsorization (p1/p99) | Cap extreme values for robustness |
 | Log1p (prec) / sqrt (surf_pre) | Remove right skew |
-| Rank normalization | Align train∪test pooled ECDF |
 
 All artifacts are fit on train only and applied at inference time — no leakage.
 
@@ -114,24 +108,14 @@ Regions are split by train–test gap:
 
 Each stratum gets its own LightGBM ensemble; predictions are blended (soft or hard) based on the region's gap distance from the threshold.
 
-### 9. Zero-Inflated Two-Stage Model
-
-With ~59.6% zero scores, a two-stage approach is used:
-- **Stage 1 (classifier):** P(score > 0) via LightGBM binary
-- **Stage 2 (regressor):** E(score | score > 0) via LightGBM L1, trained on non-zero samples only
-
-Final prediction = P(score > 0) × E(score | score > 0)
-
-### 10. Ensemble Blending
+### 9. Ensemble Blending
 
 ```
-final = lgbm_weight  × (gap_stratified_lgbm or main_lgbm)
-      + xgb_weight   × xgboost          (if available)
-      + zi_weight    × zero_inflated     (if available)
-      + ptst_weight  × patchtst          (if available)
+final = gap_stratified_lgbm  (if USE_GAP_STRATIFIED and region has stratum)
+      | main_lgbm             (fallback)
 ```
 
-Default weights: XGB=0.20, ZI=0.15, PatchTST=0.20, LGBM=remainder (~0.45).
+Isotonic calibration is applied to OOF predictions before saving.
 
 ---
 
@@ -166,31 +150,39 @@ drought/
 ├── code/
 │   ├── config.py          Global settings (flags, hyperparameters, paths)
 │   ├── logging_setup.py   Unified logging (console + file)
+│   ├── hardware.py        CPU/GPU detection
 │   ├── cache.py           SHA1 feature cache
 │   ├── preprocessing.py   Daily data preprocessing artifacts
 │   ├── climatology.py     Per-region climatology baselines
 │   ├── proxy.py           Proxy Score (meteorological → drought proxy)
 │   ├── features.py        Feature engineering (91-day rolling window)
 │   ├── temporal_cv.py     TemporalKFold implementation
-│   ├── evaluation.py      Evaluation metrics
-│   ├── data_pipeline.py   Parallel feature construction
-│   ├── adversarial.py     Adversarial sample weighting
-│   ├── model.py           LightGBM training / inference
-│   ├── ensemble.py        XGBoost training / inference + blending
-│   ├── gap_stratified.py  Gap-stratified LightGBM
-│   ├── zero_inflated.py   Zero-inflated two-stage model
-│   ├── patch_tst.py       PatchTST Transformer model
+│   ├── evaluation.py      Evaluation metrics (MAE, RMSE, R², MASE, per-region)
+│   ├── data_pipeline.py   Parallel feature construction + sample weights
+│   ├── adversarial.py     Adversarial sample weighting (currently disabled)
+│   ├── model.py           LightGBM training / inference + calibration
+│   ├── gap_stratified.py  Gap-stratified LightGBM (short / long strata)
 │   ├── train.py           Training pipeline (Stages 0–5)
 │   └── predict.py         Inference pipeline
 ├── EDA/
 │   ├── eda.py             Exploratory analysis
 │   └── figures/           EDA figures (auto-created)
 ├── models/
-│   └── per_horizon/       Per-horizon models (lgbm_fw1..5.pkl)
+│   ├── per_horizon/       Per-horizon models (lgbm_fw1..5.pkl)
+│   ├── gap_short/         Short-gap stratum models
+│   └── gap_long/          Long-gap stratum models
 ├── eval/                  Evaluation reports (eval_report.json)
 ├── logs/
 ├── submission.csv
 └── README.md
+```
+
+---
+
+## Installation
+
+```bash
+pip install lightgbm scikit-learn pandas numpy matplotlib scipy tqdm
 ```
 
 ---
@@ -213,9 +205,6 @@ python train.py --from-stage 4
 
 # Force full rebuild (ignore all caches)
 python train.py --force
-
-# Skip PatchTST (when GPU is unavailable)
-python train.py --skip-patchtst
 ```
 
 ### Inference
